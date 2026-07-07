@@ -1,229 +1,185 @@
 const noble = require('@abandonware/noble');
 
 module.exports = function (app) {
-  let plugin = {};
-  let timer = null;
+  const plugin = {};
+  plugin.id = 'racebox-signalk-plugin';
+  plugin.name = 'RaceBox BLE Telemetry';
+  plugin.description = 'Streams high-frequency GNSS and IMU data from RaceBox Mini/S/Micro into Signal K';
+
+  // Core RaceBox Protocol Constants[cite: 1]
+  const RACEBOX_SERVICE_UUID = '6e400001b5a3f393e0a9e50e24dcca9e'; // Custom UART Service[cite: 1]
+  const RACEBOX_TX_UUID = '6e400003b5a3f393e0a9e50e24dcca9e';      // Notify Characteristic[cite: 1]
+  
+  let rxBuffer = Buffer.alloc(0);
   let connectedDevice = null;
 
-  // Variables to hold live telemetry parsed from your BLE buffer streams
-  // Initialized cleanly with NO mock/fake data.
-  let liveTelemetry = {
-    latitude: null,
-    longitude: null,
-    satellites: null,
-    gpsAccuracy: null, // Horizontal accuracy in meters
-    cog: null,         // Course Over Ground in Radians
-    sog: null,         // Speed Over Ground in m/s
-    roll: 0.0,         // Radians (Streams immediately)
-    pitch: 0.0,        // Radians (Streams immediately)
-    waveHeight: 0.0,   // Meters (Streams immediately)
-    wavePeriod: 0.0,   // Seconds (Streams immediately)
-    batteryVoltage: 0.0 // Volts (Streams immediately)
-  };
-
-  plugin.id = 'signalk-racebox-imu';
-  plugin.name = 'Racebox IMU';
-  plugin.description = 'Auto-discovers and connects to a RaceBox Mini or Micro over BLE, supporting IMU data, battery voltage monitoring, and gyro calibration.';
-
-  // --- 1. SETTINGS PANEL SETUP (JSON SCHEMA) ---
-  plugin.schema = {
-    type: 'object',
-    properties: {
-      adaptiveWindow: {
-        type: 'number',
-        title: 'Adaptive Wave Window (Seconds)',
-        default: 8
-      },
-      lockDeviceMac: {
-        type: 'string',
-        title: 'Lock to Device MAC Address (Leave blank for auto-discovery)',
-        default: ''
-      },
-      calibrateGyro: {
-        type: 'boolean',
-        title: 'Calibrate IMU Gyros (Check this box and hit Save to level the device)',
-        default: false
-      }
-    }
-  };
-
-  // --- 2. PLUGIN START LOGIC ---
   plugin.start = function (options, restartPlugin) {
-    app.setProviderStatus('Starting RaceBox BLE scanning engine...');
+    app.debug('RaceBox plugin starting...');
     
-    // Check if the user flagged the configuration settings calibration checkbox
-    if (options.calibrateGyro) {
-      app.setProviderStatus('Executing IMU Gyro Calibration sequence... Keep craft completely level!');
-      // --- INSERT BLE WRITE COMMANDS FOR CALIBRATION ROUTINE HERE ---
-      options.calibrateGyro = false;
-    }
-    
-    // Track runtime options
-    let targetMac = options.lockDeviceMac ? options.lockDeviceMac.toLowerCase().trim() : null;
-
-    // Data dispatching loop sending updates to Signal K core
-    timer = setInterval(() => {
-      if (connectedDevice) {
-        app.setProviderStatus(`Streaming 25Hz telemetry from linked RaceBox [${connectedDevice.address}]`);
+    noble.on('stateChange', (state) => {
+      if (state === 'poweredOn') {
+        app.debug('BLE Powered On. Starting scan for RaceBox devices...');
+        noble.startScanning([RACEBOX_SERVICE_UUID], false);
       } else {
-        app.setProviderStatus(targetMac ? `Targeting locked device [${targetMac}]...` : 'Scanning for closest RaceBox Mini/Micro...');
+        noble.stopScanning();
       }
+    });
 
-      // Build the values array dynamically based purely on current data availability
-      let valuesArray = [];
-
-      // --- ALWAYS STREAM (Non-GPS Dependent Data) ---
-      if (liveTelemetry.batteryVoltage !== null) {
-        valuesArray.push({ path: 'electrical.batteries.racebox.voltage', value: liveTelemetry.batteryVoltage });
+    noble.on('discover', (peripheral) => {
+      // Look for RaceBox broadcast names[cite: 1]
+      if (peripheral.advertisement.localName && peripheral.advertisement.localName.startsWith('RaceBox')) {
+        app.debug(`Found device: ${peripheral.advertisement.localName}`);
+        noble.stopScanning();
+        connectToDevice(peripheral);
       }
-      if (liveTelemetry.pitch !== null) {
-        valuesArray.push({ path: 'navigation.attitude.pitch', value: liveTelemetry.pitch });
-      }
-      if (liveTelemetry.roll !== null) {
-        valuesArray.push({ path: 'navigation.attitude.roll', value: liveTelemetry.roll });
-      }
-      if (liveTelemetry.waveHeight !== null) {
-        valuesArray.push({ path: 'environment.wind.waveHeight', value: liveTelemetry.waveHeight });
-      }
-      if (liveTelemetry.wavePeriod !== null) {
-        valuesArray.push({ path: 'environment.wind.wavePeriod', value: liveTelemetry.wavePeriod });
-      }
+    });
+  };
 
-      // --- STREAM IF AVAILABLE (GNSS Status metadata) ---
-      if (liveTelemetry.satellites !== null) {
-        valuesArray.push({ path: 'navigation.gnss.satellites', value: liveTelemetry.satellites });
-      }
-      if (liveTelemetry.gpsAccuracy !== null) {
-        valuesArray.push({ path: 'navigation.gnss.horizontalAccuracy', value: liveTelemetry.gpsAccuracy });
-      }
-
-      // --- ONLY STREAM IF GPS FIX IS VALID (Omit entirely if null, undefined, or 0 position) ---
-      if (liveTelemetry.latitude !== null && liveTelemetry.longitude !== null && liveTelemetry.latitude !== 0 && liveTelemetry.longitude !== 0) {
-        valuesArray.push({
-          path: 'navigation.position',
-          value: { latitude: liveTelemetry.latitude, longitude: liveTelemetry.longitude }
-        });
-        
-        if (liveTelemetry.cog !== null) {
-          valuesArray.push({ path: 'navigation.courseOverGroundTrue', value: liveTelemetry.cog });
-        }
-        if (liveTelemetry.sog !== null) {
-          valuesArray.push({ path: 'navigation.speedOverGround', value: liveTelemetry.sog });
-        }
-      }
-
-      // Only dispatch to core if paths are ready to be sent
-      if (valuesArray.length > 0) {
-        let delta = {
-          updates: [
-            {
-              source: { label: plugin.id },
-              timestamp: new Date().toISOString(),
-              values: valuesArray
-            }
-          ]
-        };
-        app.handleMessage(plugin.id, delta);
-      }
-    }, 1000);
-
-    // --- 3. INITIALIZE NOBLE BLE DRIVERS ---
-    try {
-      noble.on('stateChange', (state) => {
-        if (state === 'poweredOn') {
-          noble.startScanning([], true);
-        } else {
-          noble.stopScanning();
-          app.setProviderStatus(`BLE Error: Bluetooth adapter state is currently: ${state}`);
-        }
-      });
-
-      noble.on('discover', (peripheral) => {
-        let name = peripheral.advertisement.localName;
-        if (name && (name.includes('RaceBox') || name.includes('RB_'))) {
-          
-          if (targetMac && peripheral.address.toLowerCase() !== targetMac) {
-            return; // Skip if it doesn't match our locked target configuration
-          }
-
-          connectedDevice = peripheral;
-          noble.stopScanning();
-          app.setProviderStatus(`Targeting locked device [${peripheral.address}]...`);
-
-          peripheral.connect((err) => {
-            if (err) {
-              connectedDevice = null;
-              app.setProviderStatus(`Connection failed to ${name}: ${err.message}`);
-              noble.startScanning([], true);
-              return;
-            }
-            
-            app.setProviderStatus(`Connected to ${name} (${peripheral.address})! Streaming telemetry...`);
-            
-            // ➡️ PASTE YOUR BLE CHARACTERISTIC NOTIFICATION PARSER HERE:
-            // Inside your noble data handler callback, update the properties directly:
-            // 
-            // characteristic.on('data', (data, isNotification) => {
-            //   // 1. Unpack your buffer bytes here...
-            //   // 2. Map directly to the live tracking object:
-            //   liveTelemetry.pitch = parsedPitchInRadians;
-            //   liveTelemetry.roll = parsedRollInRadians;
-            //   liveTelemetry.batteryVoltage = parsedVoltage;
-            //
-            //   // 3. Populate these dynamically when GPS data arrives:
-            //   liveTelemetry.satellites = totalSats;
-            //   liveTelemetry.gpsAccuracy = horizontalAccuracyMeters;
-            //   liveTelemetry.latitude = parsedLatitude;
-            //   liveTelemetry.longitude = parsedLongitude;
-            //   liveTelemetry.sog = speedOverGroundMs;
-            //   liveTelemetry.cog = courseOverGroundTrueRad;
-            // });
-          });
-
-          peripheral.on('disconnect', () => {
-            connectedDevice = null;
-            // Force reset GPS keys to null on hard disconnect so Signal K stops broadcasting expired data
-            liveTelemetry.latitude = null;
-            liveTelemetry.longitude = null;
-            liveTelemetry.satellites = null;
-            liveTelemetry.gpsAccuracy = null;
-            liveTelemetry.cog = null;
-            liveTelemetry.sog = null;
-            app.setProviderStatus('RaceBox disconnected. Resuming background auto-discovery scan...');
-            noble.startScanning([], true);
-          });
-        }
-      });
-    } catch (bleErr) {
-      app.setProviderStatus(`Noble Engine Crash: ${bleErr.message}`);
+  plugin.stop = function () {
+    app.debug('RaceBox plugin stopping...');
+    if (connectedDevice) {
+      connectedDevice.disconnect();
     }
+    noble.stopScanning();
+  };
 
-    // --- 4. ACTION PUT HOOK REGISTER ---
-    if (app.registerActionHandler) {
-      app.registerActionHandler(
-        'vessels.self',
-        'plugins.racebox.calibrate',
-        (context, path, value, callback) => {
-          app.setProviderStatus('Executing IMU Gyro Calibration sequence... Keep craft completely level!');
-          return { state: 'SUCCESS', statusCode: 200 };
+  function connectToDevice(peripheral) {
+    connectedDevice = peripheral;
+    
+    peripheral.connect((error) => {
+      if (error) {
+        app.error(`Connection error: ${error}`);
+        return;
+      }
+      app.debug('Connected to RaceBox. Discovering services...');
+      
+      peripheral.discoverSomeServicesAndCharacteristics(
+        [RACEBOX_SERVICE_UUID],
+        [RACEBOX_TX_UUID],
+        (err, services, characteristics) => {
+          if (err) {
+            app.error(`Discovery error: ${err}`);
+            return;
+          }
+          
+          const txChar = characteristics.find(c => c.uuid === RACEBOX_TX_UUID);
+          if (txChar) {
+            app.debug('Subscribing to RaceBox TX stream...');
+            txChar.subscribe((subErr) => {
+              if (subErr) app.error(`Subscription failed: ${subErr}`);
+            });
+            
+            // Handle raw incoming stream data chunk by chunk[cite: 1]
+            txChar.on('data', (data, isNotification) => {
+              processIncomingBytes(data);
+            });
+          }
         }
       );
-    }
-  };
+    });
 
-  // --- 5. CLEAN PLUGIN SHUTDOWN ---
-  plugin.stop = function () {
-    if (timer) {
-      clearInterval(timer);
-    }
-    try {
-      noble.stopScanning();
-      if (connectedDevice) {
-        connectedDevice.disconnect();
+    peripheral.on('disconnect', () => {
+      app.debug('RaceBox disconnected. Re-scanning...');
+      connectedDevice = null;
+      noble.startScanning([RACEBOX_SERVICE_UUID], false);
+    });
+  }
+
+  // FIFO Buffer Processor to re-assemble fragmented BLE packets[cite: 1]
+  function processIncomingBytes(chunk) {
+    rxBuffer = Buffer.concat([rxBuffer, chunk]);
+
+    while (rxBuffer.length >= 6) {
+      // Find sync headers: 0xB5 0x62[cite: 1]
+      if (rxBuffer[0] !== 0xB5 || rxBuffer[1] !== 0xB62) {
+        // If out of sync, advance 1 byte and try again[cite: 1]
+        rxBuffer = rxBuffer.slice(1);
+        continue;
       }
-    } catch (e) {}
-    app.setProviderStatus('Racebox IMU plugin stopped down cleanly.');
-  };
+
+      const msgClass = rxBuffer.readUInt8(2);[cite: 1]
+      const msgId = rxBuffer.readUInt8(3);[cite: 1]
+      const payloadLength = rxBuffer.readUInt16LE(4); // Length field[cite: 1]
+      const totalPacketLength = 6 + payloadLength + 2; // Header(6) + Payload(N) + Checksum(2)[cite: 1]
+
+      if (rxBuffer.length < totalPacketLength) {
+        // Wait for more data to arrive in the stream[cite: 1]
+        break;
+      }
+
+      // Extract full packet frame
+      const packet = rxBuffer.slice(0, totalPacketLength);
+      const payload = packet.slice(6, 6 + payloadLength);[cite: 1]
+
+      // Verify checksum integrity[cite: 1]
+      if (verifyChecksum(packet.slice(2, totalPacketLength - 2), packet.slice(totalPacketLength - 2))) {
+        if (msgClass === 0xFF && msgId === 0x01) { // Telemetry Data Message[cite: 1]
+          parseRaceBoxData(payload);
+        }
+      }
+
+      // Chop processed packet out of the buffer stream
+      rxBuffer = rxBuffer.slice(totalPacketLength);
+    }
+  }
+
+  function verifyChecksum(dataBytes, checksumBytes) {
+    let ckA = 0, ckB = 0;
+    for (let i = 0; i < dataBytes.length; i++) {
+      ckA = (ckA + dataBytes[i]) & 0xFF;
+      ckB = (ckB + ckA) & 0xFF;
+    }
+    return ckA === checksumBytes[0] && ckB === checksumBytes[1];
+  }
+
+  // Parse fields out of the 80-byte data payload[cite: 1]
+  // Note: Adjust specific byte offsets below if using a customized hardware revision mapping.
+  function parseRaceBoxData(payload) {
+    if (payload.length < 80) return;[cite: 1]
+
+    // 1. Verify GNSS Fix status[cite: 1]
+    const fixStatus = payload.readUInt8(14); // Example offset for Fix Status[cite: 1]
+    if (fixStatus < 2) return; // Ignore if there's no valid 2D/3D fix[cite: 1]
+
+    // 2. Extract Coordinates (Scaled by 10^7)[cite: 1]
+    const lat = payload.readInt32LE(16) / 10000000;[cite: 1]
+    const lon = payload.readInt32LE(20) / 10000000;[cite: 1]
+
+    // 3. Extract Speed & Heading[cite: 1]
+    const speedMms = payload.readUInt32LE(28); // mm/s[cite: 1]
+    const speedMs = speedMms / 1000;          // Convert mm/s to Signal K standard (m/s)
+    
+    const headingDegreesScaled = payload.readInt32LE(32); // Scaled by 10^5[cite: 1]
+    const headingRad = (headingDegreesScaled / 100000) * (Math.PI / 180); // Convert to Radians
+
+    // 4. Extract IMU G-Forces (Scaled milli-g)[cite: 1]
+    const gForceX = payload.readInt16LE(40) / 1000; // Front/Back[cite: 1]
+    const gForceY = payload.readInt16LE(42) / 1000; // Right/Left[cite: 1]
+    const gForceZ = payload.readInt16LE(44) / 1000; // Up/Down[cite: 1]
+
+    // Construct Signal K Delta Format
+    const delta = {
+      updates: [
+        {
+          source: { label: plugin.id },
+          timestamp: new Date().toISOString(),
+          values: [
+            { path: 'navigation.position', value: { latitude: lat, longitude: lon } },
+            { path: 'navigation.speedOverGround', value: speedMs },
+            { path: 'navigation.courseOverGroundTrue', value: headingRad },
+            { path: 'navigation.gnss.type', value: 'GPS+GLONASS+GALILEO' },
+            // Storing raw metrics dynamically under a custom key or standard keys if available
+            { path: 'navigation.accel.x', value: gForceX },
+            { path: 'navigation.accel.y', value: gForceY },
+            { path: 'navigation.accel.z', value: gForceZ }
+          ]
+        }
+      ]
+    };
+
+    // Emit live updates to Signal K Server pipeline
+    app.handleMessage(plugin.id, delta);
+  }
 
   return plugin;
 };
