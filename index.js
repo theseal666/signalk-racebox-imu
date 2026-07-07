@@ -315,30 +315,47 @@ module.exports = function (app) {
           app.setProviderStatus('Subscribing to 25Hz telemetry stream...');
           if (debug) app.debug('[RaceBox] Subscribing to TX characteristic...');
           
-          // Set timeout for subscription
+          // Set timeout for subscription. On some BlueZ stacks the subscribe
+          // callback never fires even though notifications flow, so the
+          // timeout only fails the connection if no data has arrived either -
+          // the first received data packet also counts as success.
           let subTimeoutId = setTimeout(() => {
+            subTimeoutId = null;
             app.setProviderStatus('Subscription timeout. Retrying...');
-            if (debug) app.debug('[RaceBox] Subscription timeout');
+            if (debug) app.debug('[RaceBox] Subscription timeout - no callback and no data received');
             cleanupAndRestartScan();
           }, SUBSCRIBE_TIMEOUT);
 
-          txChar.subscribe((subErr) => {
-            if (subTimeoutId) clearTimeout(subTimeoutId);
+          const clearSubTimeout = () => {
+            if (subTimeoutId) {
+              clearTimeout(subTimeoutId);
+              subTimeoutId = null;
+            }
+          };
 
+          txChar.subscribe((subErr) => {
             if (debug) app.debug('[RaceBox] subscribe callback, subErr:', subErr);
 
             if (subErr) {
+              clearSubTimeout();
               app.setProviderStatus(`Subscription denied: ${subErr.message}`);
               if (debug) app.debug('[RaceBox] Subscribe error:', subErr.message);
               cleanupAndRestartScan();
             } else {
+              clearSubTimeout();
               app.setProviderStatus('Streaming live data successfully into Signal K.');
               if (debug) app.debug('[RaceBox] Successfully subscribed to TX characteristic - waiting for data...');
-              dataPacketCount = 0;
             }
           });
 
           txChar.on('data', (rawBytes) => {
+            if (subTimeoutId) {
+              // Data is flowing even though the subscribe callback hasn't
+              // fired - treat the subscription as successful
+              clearSubTimeout();
+              app.setProviderStatus('Streaming live data successfully into Signal K.');
+              if (debug) app.debug('[RaceBox] Data flowing without subscribe callback - treating as subscribed');
+            }
             if (debug && dataPacketCount === 0) app.debug('[RaceBox] First data packet received, length:', rawBytes.length);
             processIncomingBytes(rawBytes);
           });
