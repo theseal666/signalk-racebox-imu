@@ -17,6 +17,7 @@ module.exports = function (app) {
   let isConnecting = false;
   let calibrationRequested = false;
   let activeOptions = {};
+  let dataPacketCount = 0;
 
   // Dynamic config options inside the Signal K Admin UI
   plugin.schema = {
@@ -24,12 +25,17 @@ module.exports = function (app) {
     properties: {
       zeroImuNow: {
         type: 'boolean',
-        title: '👉 CALIBRATE IMU: Check this box and click Save while the boat is level and floating naturally to zero out Pitch & Roll offsets.',
+        title: 'CALIBRATE IMU - Check this box and click Save while the boat is level and floating naturally to zero out Pitch & Roll offsets.',
         default: false
       },
       rebootBluetoothStack: {
         type: 'boolean',
-        title: '🔄 RESET BLUETOOTH: Check this box and click Save to force-cycle the system Bluetooth radio and clear connection lockups.',
+        title: 'RESET BLUETOOTH - Check this box and click Save to force-cycle the system Bluetooth radio and clear connection lockups.',
+        default: false
+      },
+      debugLogging: {
+        type: 'boolean',
+        title: 'Enable debug logging to console',
         default: false
       },
       offsets: {
@@ -45,16 +51,39 @@ module.exports = function (app) {
 
   plugin.start = function (options) {
     activeOptions = options || { offsets: { pitch: 0, roll: 0 } };
+    const debug = activeOptions.debugLogging;
+
+    if (debug) {
+      app.debug('[RaceBox] Plugin starting with options:', JSON.stringify(activeOptions));
+    }
 
     // Action 1: Hard Reset Linux Bluetooth Stack
     if (activeOptions.rebootBluetoothStack) {
-      app.setProviderStatus('Executing hardware hcitool/hciconfig reset...');
+      app.setProviderStatus('RESET: Executing hciconfig reset...');
+      if (debug) app.debug('[RaceBox] Bluetooth reset requested');
+      
       activeOptions.rebootBluetoothStack = false;
-      app.savePluginOptions(activeOptions, () => {
-        app.debug('Bluetooth stack reset initiated.');
+      app.savePluginOptions(activeOptions, (err) => {
+        if (err) {
+          app.error('[RaceBox] Failed to clear reset flag:', err);
+        } else {
+          if (debug) app.debug('[RaceBox] Reset flag cleared in config');
+        }
       });
-      exec('sudo hciconfig hci0 down && sudo hciconfig hci0 up', () => {
-        app.debug('hciconfig command completed.');
+
+      // Execute reset command with proper error handling
+      exec('sudo hciconfig hci0 down && sudo hciconfig hci0 up', (error, stdout, stderr) => {
+        if (error) {
+          app.error('[RaceBox] Bluetooth reset error:', error.message);
+          app.setProviderStatus('RESET FAILED: ' + error.message);
+          if (debug) app.debug('[RaceBox] stderr:', stderr);
+        } else {
+          if (debug) app.debug('[RaceBox] Bluetooth reset completed successfully');
+          app.setProviderStatus('RESET: Bluetooth stack cycled. Scanning for RaceBox...');
+          // Restart plugin after reset
+          plugin.stop();
+          plugin.start(activeOptions);
+        }
       });
       return;
     }
@@ -62,12 +91,23 @@ module.exports = function (app) {
     // Action 2: Arm Calibration Flag
     if (activeOptions.zeroImuNow) {
       calibrationRequested = true;
-      app.setProviderStatus('Armed for calibration! Awaiting next clean data packet...');
+      app.setProviderStatus('CAL: Armed for calibration. Boat must be level and floating naturally.');
+      if (debug) app.debug('[RaceBox] Calibration mode armed');
+      
       // Clear the flag immediately so it doesn't persist after save
       activeOptions.zeroImuNow = false;
-      app.savePluginOptions(activeOptions, () => {});
+      dataPacketCount = 0;
+      
+      app.savePluginOptions(activeOptions, (err) => {
+        if (err) {
+          app.error('[RaceBox] Failed to clear calibration flag:', err);
+        } else {
+          if (debug) app.debug('[RaceBox] Calibration flag cleared in config');
+        }
+      });
     } else {
       app.setProviderStatus('Initializing Bluetooth subsystem...');
+      if (debug) app.debug('[RaceBox] Normal startup');
     }
 
     // Clean old listeners to prevent memory leaking duplication
@@ -75,6 +115,8 @@ module.exports = function (app) {
     noble.removeAllListeners('discover');
 
     noble.on('stateChange', (state) => {
+      if (debug) app.debug('[RaceBox] Bluetooth state changed to:', state);
+      
       if (state === 'poweredOn') {
         if (!connectedPeripheral && !isConnecting) {
           app.setProviderStatus('Scanning for RaceBox hardware...');
@@ -93,6 +135,7 @@ module.exports = function (app) {
       if (localName && localName.startsWith('RaceBox')) {
         isConnecting = true;
         app.setProviderStatus(`Found ${localName}! Opening connection channel...`);
+        if (debug) app.debug(`[RaceBox] Discovered device: ${localName}`);
         noble.stopScanning();
 
         // 500ms delay protects against BlueZ concurrent socket request crashes
@@ -104,6 +147,8 @@ module.exports = function (app) {
     if (noble.state === 'poweredOn') {
       app.setProviderStatus('Scanning for RaceBox hardware...');
       noble.startScanning([], false);
+    } else {
+      if (debug) app.debug('[RaceBox] Bluetooth not yet powered on, state:', noble.state);
     }
   };
 
@@ -125,16 +170,19 @@ module.exports = function (app) {
     peripheral.connect((err) => {
       if (err) {
         app.setProviderStatus(`Link failed: ${err.message}. Retrying...`);
+        if (activeOptions.debugLogging) app.debug('[RaceBox] Connection error:', err.message);
         cleanupAndRestartScan();
         return;
       }
 
       app.setProviderStatus('Connected. Syncing targeted GATT profile...');
+      if (activeOptions.debugLogging) app.debug('[RaceBox] Connected to RaceBox device');
 
       // Explicitly find ONLY the exact RaceBox Service UUID
       peripheral.discoverServices([SERVICE_UUID], (sErr, services) => {
         if (sErr || !services || services.length === 0) {
           app.setProviderStatus('Error: Targeted RaceBox service structure not exposed.');
+          if (activeOptions.debugLogging) app.debug('[RaceBox] Service discovery error:', sErr);
           cleanupAndRestartScan();
           return;
         }
@@ -146,6 +194,7 @@ module.exports = function (app) {
 
           if (cErr || !characteristics) {
             app.setProviderStatus('Error: Could not discover RaceBox characteristics.');
+            if (activeOptions.debugLogging) app.debug('[RaceBox] Characteristic discovery error:', cErr);
             cleanupAndRestartScan();
             return;
           }
@@ -155,12 +204,13 @@ module.exports = function (app) {
 
           if (!txChar) {
             app.setProviderStatus('Error: TX characteristic (data stream) not found.');
+            if (activeOptions.debugLogging) app.debug('[RaceBox] TX characteristic not found');
             cleanupAndRestartScan();
             return;
           }
 
           if (!rxChar) {
-            app.debug('Warning: RX characteristic not found. Device may not accept commands.');
+            if (activeOptions.debugLogging) app.debug('[RaceBox] Warning: RX characteristic not found.');
           }
 
           // Subscribe to TX (device → host data stream)
@@ -168,9 +218,12 @@ module.exports = function (app) {
           txChar.subscribe((subErr) => {
             if (subErr) {
               app.setProviderStatus(`Subscription denied: ${subErr.message}`);
+              if (activeOptions.debugLogging) app.debug('[RaceBox] Subscribe error:', subErr.message);
               cleanupAndRestartScan();
             } else {
               app.setProviderStatus('Streaming live data successfully into Signal K.');
+              if (activeOptions.debugLogging) app.debug('[RaceBox] Successfully subscribed to TX characteristic');
+              dataPacketCount = 0;
             }
           });
 
@@ -183,6 +236,7 @@ module.exports = function (app) {
 
     peripheral.on('disconnect', () => {
       app.setProviderStatus('Device link severed. Searching for hardware...');
+      if (activeOptions.debugLogging) app.debug('[RaceBox] Device disconnected unexpectedly');
       cleanupAndRestartScan();
     });
   }
@@ -242,6 +296,8 @@ module.exports = function (app) {
   function parseRaceBoxData(payload) {
     if (payload.length < 80) return;
 
+    dataPacketCount++;
+
     const values = [];
 
     // 1. Raw 6-Axis IMU Sensor Channels
@@ -261,20 +317,23 @@ module.exports = function (app) {
     if (calibrationRequested) {
       calibrationRequested = false;
       activeOptions.offsets = { pitch: calculatedPitch, roll: calculatedRoll };
-      app.debug(`Boat alignment calibration captured: Roll=${calculatedRoll.toFixed(4)} rad, Pitch=${calculatedPitch.toFixed(4)} rad`);
-      app.setProviderStatus('Calibration captured! Offsets will be applied immediately.');
       
-      // Save asynchronously WITHOUT triggering a plugin restart
-      // Use setImmediate to avoid blocking data stream
-      setImmediate(() => {
+      if (activeOptions.debugLogging) {
+        app.debug(`[RaceBox] CAL CAPTURED at packet ${dataPacketCount}: Roll=${calculatedRoll.toFixed(4)} rad, Pitch=${calculatedPitch.toFixed(4)} rad`);
+      }
+      app.setProviderStatus(`Calibration captured at packet ${dataPacketCount}. Offsets applied.`);
+      
+      // Do NOT save during data stream - just apply immediately
+      // Save will happen asynchronously in a timeout to avoid blocking
+      setTimeout(() => {
         app.savePluginOptions(activeOptions, (err) => {
           if (err) {
-            app.error('Failed to persist calibration offsets:', err);
+            app.error('[RaceBox] Failed to persist calibration offsets:', err);
           } else {
-            app.debug('Calibration offsets persisted to config.');
+            if (activeOptions.debugLogging) app.debug('[RaceBox] Calibration offsets persisted to config.');
           }
         });
-      });
+      }, 0);
     }
 
     // Apply baseline alignment offsets
@@ -342,7 +401,8 @@ module.exports = function (app) {
     }
 
     // Deliver unified delta packet to Signal K Data Broker
-    app.handleDelta({
+    // Using handleMessage with correct Signal K delta format
+    app.handleMessage(plugin.id, {
       updates: [
         {
           source: { label: plugin.id },
@@ -351,6 +411,10 @@ module.exports = function (app) {
         }
       ]
     });
+
+    if (activeOptions.debugLogging && (dataPacketCount % 25 === 0)) {
+      app.debug(`[RaceBox] Received ${dataPacketCount} data packets, last roll=${finalRoll.toFixed(4)}`);
+    }
   }
 
   return plugin;
