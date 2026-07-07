@@ -136,8 +136,9 @@ module.exports = function (app) {
           return;
         }
 
-        // Discover BOTH TX and RX characteristics
-        peripheral.discoverCharacteristics([TX_UUID, RX_UUID], (cErr, characteristics) => {
+        // Now discover characteristics on the SERVICE, not the peripheral
+        const service = services[0];
+        service.discoverCharacteristics([TX_UUID, RX_UUID], (cErr, characteristics) => {
           isConnecting = false; 
 
           if (cErr || !characteristics) {
