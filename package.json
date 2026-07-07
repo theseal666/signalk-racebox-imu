@@ -1,20 +1,31 @@
 {
-  "name": "signalk-racebox-micro",
+  "name": "signalk-racebox-imu",
   "version": "1.0.0",
-  "description": "Signal K plugin for Racebox Micro 25Hz GPS and IMU",
+  "description": "Auto-discovers and connects to a RaceBox Mini or Micro over BLE, sending high-precision IMU, GNSS, and calculated wave data to Signal K.",
   "main": "index.js",
-  "signalk-plugin": {
-    "name": "Racebox Micro"
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [
-    "signalk-node-server-plugin",
-    "signalk",
-    "racebox",
-    "gps",
-    "imu"
+    "signalk-node-plugin"
   ],
+  "author": "theseal666",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/theseal666/signalk-racebox-imu.git"
+  },
+  "bugs": {
+    "url": "https://github.com/theseal666/signalk-racebox-imu/issues"
+  },
+  "homepage": "https://github.com/theseal666/signalk-racebox-imu#readme",
   "dependencies": {
-    "@abandonware/noble": "^1.9.2", 
-    "serialport": "^12.0.0"
+    "@abandonware/noble": "^1.9.2-17"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "signalK": {
+    "main": "index.js"
   }
 }
