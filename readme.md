@@ -22,7 +22,7 @@ Because this plugin utilizes Bluetooth Low Energy (`@abandonware/noble`), the ho
 ### 1. Install System Packages
 Run the following command on your Raspberry Pi terminal to install the necessary BLE development libraries:
 
-```bash
+bash
 sudo apt-get install bluetooth bluez libbluetooth-dev libudev-dev
 2. Grant Permissions to Node.js (Crucial for Raspberry Pi)
 By default, Linux prevents non-root applications (like the Node.js process running Signal K) from accessing the Bluetooth controller interface. Grant the required permissions by running:
