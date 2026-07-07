@@ -1,6 +1,4 @@
-Here is the complete, integrated file containing your existing code structure alongside the interactive calibration configuration property and status routing tweaks.
-
-```javascript
+javascript
 const noble = require('@abandonware/noble');
 
 module.exports = function (app) {
@@ -185,4 +183,3 @@ module.exports = function (app) {
   return plugin;
 };
 
-```
