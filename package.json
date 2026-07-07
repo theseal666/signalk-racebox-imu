@@ -7,7 +7,7 @@
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [
-    "signalk-node-plugin"
+    "signalk-plugin"
   ],
   "author": "theseal666",
   "license": "MIT",
