@@ -1,4 +1,3 @@
-javascript
 const noble = require('@abandonware/noble');
 
 module.exports = function (app) {
@@ -132,9 +131,6 @@ module.exports = function (app) {
             }
             
             app.setProviderStatus(`Connected to ${name} (${peripheral.address})! Streaming telemetry...`);
-            
-            // Core logic: Query services here to find your parsing handle metrics
-            // (e.g., peripheral.discoverAllServicesAndCharacteristics...)
           });
 
           peripheral.on('disconnect', () => {
@@ -155,11 +151,6 @@ module.exports = function (app) {
         'plugins.racebox.calibrate',
         (context, path, value, callback) => {
           app.setProviderStatus('Executing IMU Gyro Calibration sequence... Keep craft completely level!');
-          
-          // --- BLE REWRITE FOR CALIBRATION COMMAND ---
-          // Code to write specific hex codes down to your racebox's configuration characteristic goes here.
-          // Example: calibrationCharacteristic.write(Buffer.from([0xXX, 0xXX]), true);
-          
           return { state: 'SUCCESS', statusCode: 200 };
         }
       );
@@ -182,4 +173,3 @@ module.exports = function (app) {
 
   return plugin;
 };
-
