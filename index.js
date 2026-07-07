@@ -23,11 +23,6 @@ module.exports = function (app) {
         title: 'Lock to Device MAC Address (Leave blank for auto-discovery)',
         default: ''
       },
-      enableLogging: {
-        type: 'boolean',
-        title: 'Data Logging Enabled',
-        default: true
-      },
       calibrateGyro: {
         type: 'boolean',
         title: 'Calibrate IMU Gyros (Check this box and hit Save to level the device)',
@@ -63,7 +58,6 @@ module.exports = function (app) {
       }
 
       // --- TELEMETRY INGESTION ---
-      let sampleBatteryCapacity = 0.85; // 85%
       let sampleBatteryVoltage = 3.95;   // 3.95 Volts
       let samplePitch = 0.02;            // Radians
       let sampleRoll = -0.05;            // Radians
@@ -74,10 +68,6 @@ module.exports = function (app) {
             source: { label: plugin.id },
             timestamp: new Date().toISOString(),
             values: [
-              {
-                path: 'electrical.batteries.racebox.capacity.stateOfCharge',
-                value: sampleBatteryCapacity
-              },
               {
                 path: 'electrical.batteries.racebox.voltage',
                 value: sampleBatteryVoltage
