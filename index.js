@@ -27,6 +27,7 @@ module.exports = function (app) {
   let dataPacketCount = 0;
   let scanTimeoutId = null;
   let connectTimeoutId = null;
+  let debug = false;
 
   // Dynamic config options inside the Signal K Admin UI
   plugin.schema = {
@@ -45,7 +46,7 @@ module.exports = function (app) {
       debugLogging: {
         type: 'boolean',
         title: 'Enable debug logging to console',
-        default: false
+        default: true
       },
       offsets: {
         type: 'object',
@@ -60,9 +61,10 @@ module.exports = function (app) {
 
   plugin.start = function (options) {
     activeOptions = options || { offsets: { pitch: 0, roll: 0 } };
-    const debug = activeOptions.debugLogging;
+    debug = activeOptions.debugLogging !== false; // Default to true
 
     if (debug) {
+      app.debug('[RaceBox] ========== PLUGIN START ==========');
       app.debug('[RaceBox] Plugin starting with options:', JSON.stringify(activeOptions));
     }
 
@@ -129,6 +131,7 @@ module.exports = function (app) {
       if (state === 'poweredOn') {
         if (!connectedPeripheral && !isConnecting) {
           app.setProviderStatus('Scanning for RaceBox hardware...');
+          if (debug) app.debug('[RaceBox] Starting scan...');
           // Defer scanning to next tick to avoid blocking Signal K
           setImmediate(() => {
             noble.startScanning([], false);
@@ -161,10 +164,12 @@ module.exports = function (app) {
       if (isConnecting || connectedPeripheral) return;
 
       const localName = peripheral.advertisement.localName;
+      if (debug) app.debug('[RaceBox] Discovered device:', localName);
+      
       if (localName && localName.startsWith('RaceBox')) {
         isConnecting = true;
         app.setProviderStatus(`Found ${localName}! Opening connection channel...`);
-        if (debug) app.debug(`[RaceBox] Discovered device: ${localName}`);
+        if (debug) app.debug(`[RaceBox] Connecting to RaceBox device: ${localName}`);
         
         // Clear scan timeout when device found
         if (scanTimeoutId) clearTimeout(scanTimeoutId);
@@ -180,6 +185,7 @@ module.exports = function (app) {
     // Fire initial state check manually
     if (noble.state === 'poweredOn') {
       app.setProviderStatus('Scanning for RaceBox hardware...');
+      if (debug) app.debug('[RaceBox] Bluetooth already powered on, starting initial scan');
       // Defer to next tick
       setImmediate(() => {
         noble.startScanning([], false);
@@ -204,6 +210,7 @@ module.exports = function (app) {
 
   plugin.stop = function () {
     app.setProviderStatus('Stopped');
+    if (debug) app.debug('[RaceBox] ========== PLUGIN STOP ==========');
     
     if (scanTimeoutId) clearTimeout(scanTimeoutId);
     if (connectTimeoutId) clearTimeout(connectTimeoutId);
@@ -220,12 +227,13 @@ module.exports = function (app) {
 
   function connectToDevice(peripheral) {
     connectedPeripheral = peripheral;
+    if (debug) app.debug('[RaceBox] connectToDevice() called');
 
     // Set connection timeout
     if (connectTimeoutId) clearTimeout(connectTimeoutId);
     connectTimeoutId = setTimeout(() => {
       app.setProviderStatus('Connection timeout. Retrying...');
-      if (activeOptions.debugLogging) app.debug('[RaceBox] Connection timeout');
+      if (debug) app.debug('[RaceBox] Connection timeout');
       cleanupAndRestartScan();
     }, CONNECT_TIMEOUT);
 
@@ -235,18 +243,18 @@ module.exports = function (app) {
 
       if (err) {
         app.setProviderStatus(`Link failed: ${err.message}. Retrying...`);
-        if (activeOptions.debugLogging) app.debug('[RaceBox] Connection error:', err.message);
+        if (debug) app.debug('[RaceBox] Connection error:', err.message);
         cleanupAndRestartScan();
         return;
       }
 
       app.setProviderStatus('Connected. Syncing targeted GATT profile...');
-      if (activeOptions.debugLogging) app.debug('[RaceBox] Connected to RaceBox device');
+      if (debug) app.debug('[RaceBox] Connected to RaceBox device, discovering services...');
 
       // Set timeout for service discovery
       let servicesTimeoutId = setTimeout(() => {
         app.setProviderStatus('Service discovery timeout. Retrying...');
-        if (activeOptions.debugLogging) app.debug('[RaceBox] Service discovery timeout');
+        if (debug) app.debug('[RaceBox] Service discovery timeout');
         cleanupAndRestartScan();
       }, DISCOVER_SERVICES_TIMEOUT);
 
@@ -254,30 +262,35 @@ module.exports = function (app) {
       peripheral.discoverServices([SERVICE_UUID], (sErr, services) => {
         if (servicesTimeoutId) clearTimeout(servicesTimeoutId);
 
+        if (debug) app.debug('[RaceBox] discoverServices callback, sErr:', sErr, 'services:', services ? services.length : 'null');
+
         if (sErr || !services || services.length === 0) {
           app.setProviderStatus('Error: Targeted RaceBox service structure not exposed.');
-          if (activeOptions.debugLogging) app.debug('[RaceBox] Service discovery error:', sErr);
+          if (debug) app.debug('[RaceBox] Service discovery error:', sErr);
           cleanupAndRestartScan();
           return;
         }
 
         // Now discover characteristics on the SERVICE, not the peripheral
         const service = services[0];
+        if (debug) app.debug('[RaceBox] Found service, discovering characteristics...');
         
         // Set timeout for characteristic discovery
         let charsTimeoutId = setTimeout(() => {
           app.setProviderStatus('Characteristic discovery timeout. Retrying...');
-          if (activeOptions.debugLogging) app.debug('[RaceBox] Characteristic discovery timeout');
+          if (debug) app.debug('[RaceBox] Characteristic discovery timeout');
           cleanupAndRestartScan();
         }, DISCOVER_CHARACTERISTICS_TIMEOUT);
 
         service.discoverCharacteristics([TX_UUID, RX_UUID], (cErr, characteristics) => {
           if (charsTimeoutId) clearTimeout(charsTimeoutId);
-          isConnecting = false; 
+          isConnecting = false;
+
+          if (debug) app.debug('[RaceBox] discoverCharacteristics callback, cErr:', cErr, 'characteristics:', characteristics ? characteristics.length : 'null');
 
           if (cErr || !characteristics) {
             app.setProviderStatus('Error: Could not discover RaceBox characteristics.');
-            if (activeOptions.debugLogging) app.debug('[RaceBox] Characteristic discovery error:', cErr);
+            if (debug) app.debug('[RaceBox] Characteristic discovery error:', cErr);
             cleanupAndRestartScan();
             return;
           }
@@ -285,42 +298,48 @@ module.exports = function (app) {
           const txChar = characteristics.find(c => c.uuid === TX_UUID);
           const rxChar = characteristics.find(c => c.uuid === RX_UUID);
 
+          if (debug) app.debug('[RaceBox] TX characteristic found:', !!txChar, 'RX characteristic found:', !!rxChar);
+
           if (!txChar) {
             app.setProviderStatus('Error: TX characteristic (data stream) not found.');
-            if (activeOptions.debugLogging) app.debug('[RaceBox] TX characteristic not found');
+            if (debug) app.debug('[RaceBox] TX characteristic not found');
             cleanupAndRestartScan();
             return;
           }
 
           if (!rxChar) {
-            if (activeOptions.debugLogging) app.debug('[RaceBox] Warning: RX characteristic not found.');
+            if (debug) app.debug('[RaceBox] Warning: RX characteristic not found.');
           }
 
           // Subscribe to TX (device → host data stream)
           app.setProviderStatus('Subscribing to 25Hz telemetry stream...');
+          if (debug) app.debug('[RaceBox] Subscribing to TX characteristic...');
           
           // Set timeout for subscription
           let subTimeoutId = setTimeout(() => {
             app.setProviderStatus('Subscription timeout. Retrying...');
-            if (activeOptions.debugLogging) app.debug('[RaceBox] Subscription timeout');
+            if (debug) app.debug('[RaceBox] Subscription timeout');
             cleanupAndRestartScan();
           }, SUBSCRIBE_TIMEOUT);
 
           txChar.subscribe((subErr) => {
             if (subTimeoutId) clearTimeout(subTimeoutId);
 
+            if (debug) app.debug('[RaceBox] subscribe callback, subErr:', subErr);
+
             if (subErr) {
               app.setProviderStatus(`Subscription denied: ${subErr.message}`);
-              if (activeOptions.debugLogging) app.debug('[RaceBox] Subscribe error:', subErr.message);
+              if (debug) app.debug('[RaceBox] Subscribe error:', subErr.message);
               cleanupAndRestartScan();
             } else {
               app.setProviderStatus('Streaming live data successfully into Signal K.');
-              if (activeOptions.debugLogging) app.debug('[RaceBox] Successfully subscribed to TX characteristic');
+              if (debug) app.debug('[RaceBox] Successfully subscribed to TX characteristic - waiting for data...');
               dataPacketCount = 0;
             }
           });
 
           txChar.on('data', (rawBytes) => {
+            if (debug && dataPacketCount === 0) app.debug('[RaceBox] First data packet received, length:', rawBytes.length);
             processIncomingBytes(rawBytes);
           });
         });
@@ -329,12 +348,14 @@ module.exports = function (app) {
 
     peripheral.on('disconnect', () => {
       app.setProviderStatus('Device link severed. Searching for hardware...');
-      if (activeOptions.debugLogging) app.debug('[RaceBox] Device disconnected unexpectedly');
+      if (debug) app.debug('[RaceBox] Device disconnected unexpectedly');
       cleanupAndRestartScan();
     });
   }
 
   function cleanupAndRestartScan() {
+    if (debug) app.debug('[RaceBox] cleanupAndRestartScan() called');
+    
     if (connectedPeripheral) {
       try { connectedPeripheral.disconnect(); } catch(e) {}
     }
@@ -350,7 +371,7 @@ module.exports = function (app) {
         // Set scan timeout
         if (scanTimeoutId) clearTimeout(scanTimeoutId);
         scanTimeoutId = setTimeout(() => {
-          if (activeOptions.debugLogging) app.debug('[RaceBox] Recovery scan timeout');
+          if (debug) app.debug('[RaceBox] Recovery scan timeout');
           noble.stopScanning();
           scanTimeoutId = null;
           setTimeout(() => {
@@ -367,6 +388,10 @@ module.exports = function (app) {
   function processIncomingBytes(chunk) {
     rxBuffer = Buffer.concat([rxBuffer, chunk]);
 
+    if (debug && dataPacketCount === 0) {
+      app.debug('[RaceBox] First chunk received, length:', chunk.length, 'buffer total:', rxBuffer.length);
+    }
+
     // Yield to event loop every 100 packets to keep Signal K responsive
     if (dataPacketCount % 100 === 0) {
       setImmediate(() => {});
@@ -374,6 +399,7 @@ module.exports = function (app) {
 
     while (rxBuffer.length >= 6) {
       if (rxBuffer[0] !== 0xB5 || rxBuffer[1] !== 0x62) {
+        if (debug && dataPacketCount === 0) app.debug('[RaceBox] Invalid packet header, searching for sync...');
         rxBuffer = rxBuffer.slice(1);
         continue;
       }
@@ -382,6 +408,10 @@ module.exports = function (app) {
       const msgId = rxBuffer.readUInt8(3);
       const payloadLength = rxBuffer.readUInt16LE(4);
       const totalPacketLength = 6 + payloadLength + 2;
+
+      if (debug && dataPacketCount === 0) {
+        app.debug('[RaceBox] Found packet header, msgClass:', msgClass.toString(16), 'msgId:', msgId.toString(16), 'payloadLength:', payloadLength, 'totalLength:', totalPacketLength);
+      }
 
       if (rxBuffer.length < totalPacketLength) {
         break; 
@@ -397,9 +427,26 @@ module.exports = function (app) {
         ckB = (ckB + ckA) & 0xFF;
       }
 
+      if (debug && dataPacketCount === 0) {
+        app.debug('[RaceBox] Checksum - calculated:', ckA.toString(16), ckB.toString(16), 'expected:', packet[totalPacketLength - 2].toString(16), packet[totalPacketLength - 1].toString(16));
+      }
+
       if (ckA === packet[totalPacketLength - 2] && ckB === packet[totalPacketLength - 1]) {
+        if (debug && dataPacketCount === 0) {
+          app.debug('[RaceBox] Checksum VALID');
+        }
+
         if (msgClass === 0xFF && msgId === 0x01) {
+          if (debug && dataPacketCount === 0) app.debug('[RaceBox] Valid RaceBox packet! Parsing data...');
           parseRaceBoxData(payload);
+        } else {
+          if (debug && dataPacketCount === 0) {
+            app.debug('[RaceBox] Packet is not RaceBox telemetry (msgClass:', msgClass.toString(16), 'msgId:', msgId.toString(16), ')');
+          }
+        }
+      } else {
+        if (debug && dataPacketCount === 0) {
+          app.debug('[RaceBox] Checksum FAILED');
         }
       }
 
@@ -409,20 +456,27 @@ module.exports = function (app) {
 
   // --- Core Binary Packet Parser ---
   function parseRaceBoxData(payload) {
-    if (payload.length < 80) return;
+    if (payload.length < 80) {
+      if (debug) app.debug('[RaceBox] Payload too short:', payload.length);
+      return;
+    }
 
     dataPacketCount++;
 
     const values = [];
 
     // 1. Raw 6-Axis IMU Sensor Channels
-    const accelX = payload.readInt16LE(40) / 1000; // Front/Back (g)
-    const accelY = payload.readInt16LE(42) / 1000; // Side/Side (g)
-    const accelZ = payload.readInt16LE(44) / 1000; // Vertical (g)
+    const accelX = payload.readInt16LE(40) / 1000;
+    const accelY = payload.readInt16LE(42) / 1000;
+    const accelZ = payload.readInt16LE(44) / 1000;
 
-    const gyroX = (payload.readInt16LE(46) / 100) * (Math.PI / 180); // Roll rate (rad/s)
-    const gyroY = (payload.readInt16LE(48) / 100) * (Math.PI / 180); // Pitch rate (rad/s)
-    const gyroZ = (payload.readInt16LE(50) / 100) * (Math.PI / 180); // Yaw rate/Rate of Turn (rad/s)
+    const gyroX = (payload.readInt16LE(46) / 100) * (Math.PI / 180);
+    const gyroY = (payload.readInt16LE(48) / 100) * (Math.PI / 180);
+    const gyroZ = (payload.readInt16LE(50) / 100) * (Math.PI / 180);
+
+    if (debug && dataPacketCount === 1) {
+      app.debug('[RaceBox] Packet 1: accelX=', accelX, 'accelY=', accelY, 'accelZ=', accelZ);
+    }
 
     // Calculate immediate derived Pitch/Roll orientation angles
     const calculatedRoll = Math.atan2(accelY, accelZ);
@@ -433,19 +487,17 @@ module.exports = function (app) {
       calibrationRequested = false;
       activeOptions.offsets = { pitch: calculatedPitch, roll: calculatedRoll };
       
-      if (activeOptions.debugLogging) {
+      if (debug) {
         app.debug(`[RaceBox] CAL CAPTURED at packet ${dataPacketCount}: Roll=${calculatedRoll.toFixed(4)} rad, Pitch=${calculatedPitch.toFixed(4)} rad`);
       }
       app.setProviderStatus(`Calibration captured at packet ${dataPacketCount}. Offsets applied.`);
       
-      // Do NOT save during data stream - just apply immediately
-      // Save will happen asynchronously in a timeout to avoid blocking
       setTimeout(() => {
         app.savePluginOptions(activeOptions, (err) => {
           if (err) {
             app.error('[RaceBox] Failed to persist calibration offsets:', err);
           } else {
-            if (activeOptions.debugLogging) app.debug('[RaceBox] Calibration offsets persisted to config.');
+            if (debug) app.debug('[RaceBox] Calibration offsets persisted to config.');
           }
         });
       }, 0);
@@ -460,7 +512,7 @@ module.exports = function (app) {
     values.push(
       { path: 'navigation.attitude.roll', value: finalRoll },
       { path: 'navigation.attitude.pitch', value: finalPitch },
-      { path: 'navigation.rateOfTurn', value: gyroZ }, // Gyro Z is standard ROT
+      { path: 'navigation.rateOfTurn', value: gyroZ },
       { path: 'navigation.accel.x', value: accelX },
       { path: 'navigation.accel.y', value: accelY },
       { path: 'navigation.accel.z', value: accelZ },
@@ -469,9 +521,9 @@ module.exports = function (app) {
     );
 
     // 2. Read System State Metrics
-    const batteryPercent = payload.readUInt8(52); // Battery level %
-    const batteryRaw = payload.readUInt16LE(53);   // Battery voltage (raw, usually mV)
-    const batteryVoltage = batteryRaw / 1000;      // Convert to Volts
+    const batteryPercent = payload.readUInt8(52);
+    const batteryRaw = payload.readUInt16LE(53);
+    const batteryVoltage = batteryRaw / 1000;
     
     values.push(
       { 
@@ -487,13 +539,13 @@ module.exports = function (app) {
     // 3. High-Performance GNSS Engine Extraction
     const fixStatus = payload.readUInt8(14); 
     const satellitesConnected = payload.readUInt8(15);
-    const positionAccuracyMm = payload.readUInt32LE(36); // Horizontal Accuracy (mm)
-    const positionAccuracyM = positionAccuracyMm / 1000;  // Convert to meters
+    const positionAccuracyMm = payload.readUInt32LE(36);
+    const positionAccuracyM = positionAccuracyMm / 1000;
 
     values.push(
       { path: 'navigation.gnss.satellites', value: satellitesConnected },
       { path: 'navigation.gnss.horizontalDilution', value: positionAccuracyM },
-      { path: 'navigation.gnss.positionError', value: positionAccuracyM } // GPS error in meters
+      { path: 'navigation.gnss.positionError', value: positionAccuracyM }
     );
 
     // Only broadcast tracking and position vectors if a live 2D/3D fix exists
@@ -516,7 +568,19 @@ module.exports = function (app) {
     }
 
     // Deliver unified delta packet to Signal K Data Broker
-    // Using handleMessage with correct Signal K delta format
+    if (debug && dataPacketCount === 1) {
+      app.debug('[RaceBox] Sending first delta to Signal K with', values.length, 'values');
+      app.debug('[RaceBox] Delta:', JSON.stringify({
+        updates: [
+          {
+            source: { label: plugin.id },
+            timestamp: new Date().toISOString(),
+            values: values.slice(0, 3)
+          }
+        ]
+      }));
+    }
+
     app.handleMessage(plugin.id, {
       updates: [
         {
@@ -527,7 +591,7 @@ module.exports = function (app) {
       ]
     });
 
-    if (activeOptions.debugLogging && (dataPacketCount % 25 === 0)) {
+    if (debug && (dataPacketCount % 25 === 0)) {
       app.debug(`[RaceBox] Received ${dataPacketCount} data packets, last roll=${finalRoll.toFixed(4)}`);
     }
   }
