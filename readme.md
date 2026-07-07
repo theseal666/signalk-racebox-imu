@@ -2,15 +2,19 @@
 
 A Signal K plugin to auto-discover, pair, and stream telemetry from a **RaceBox Mini** or **RaceBox Micro** over Bluetooth Low Energy (BLE). 
 
-This plugin extracts high-frequency IMU and GNSS data directly from the proprietary RaceBox binary stream and converts it into standard Signal K paths. It also includes an adaptive spectral analysis window to track ocean wave heights and periods without requiring manual calibration.
+This plugin extracts high-frequency IMU and GNSS data directly from the proprietary RaceBox binary stream and converts it into standard Signal K paths. Streams at 25Hz with full 6-axis IMU (accelerometer + gyroscope), GPS/GNSS position, course/speed, battery voltage monitoring, and satellite tracking.
 
 ---
 
 ## Features
 * **Zero Configuration Pairing:** Auto-discovers and pairs with the first available RaceBox device—no MAC addresses to find or type.
-* **Full Telemetry Mapping:** Extracts Position, SOG, COG, Pitch, Roll, and Satellite Count.
-* **Adaptive Wave Profiling:** Runs numerical double-integration on the earth-axis vertical acceleration vector to calculate dynamic wave heights and periods.
-* **App Store Native:** Integrates smoothly into the Signal K Admin UI with live connection logging and a one-click hardware reset switch.
+* **Full Telemetry Mapping:** Extracts Position, SOG, COG, Pitch, Roll, Satellite Count, Battery Voltage, and GPS Accuracy.
+* **6-Axis IMU Streaming:** Outputs raw accelerometer (X/Y/Z) and gyroscope (X/Y/Z) data at 25Hz for high-precision navigation and motion analysis.
+* **GPS Quality Metrics:** Reports number of satellites, horizontal position error, and fix status.
+* **Battery Monitoring:** Real-time battery percentage and voltage tracking.
+* **In-App Calibration:** Zero out Pitch & Roll offsets while boat is level—saved to config for future sessions.
+* **Hardware Reset Control:** One-click Bluetooth radio reset from Signal K Admin UI to clear connection lockups.
+* **App Store Native:** Integrates smoothly into the Signal K Admin UI with live connection logging and status updates.
 
 ---
 
@@ -62,13 +66,11 @@ cd ~/.signalk
 
 ```
 
-
 3. Install the plugin directly from your GitHub repository:
 ```bash
-npm install [https://github.com/theseal666/signalk-racebox-imu.git](https://github.com/theseal666/signalk-racebox-imu.git)
+npm install https://github.com/theseal666/signalk-racebox-imu.git
 
 ```
-
 
 4. Restart your Signal K server:
 ```bash
@@ -76,44 +78,89 @@ sudo systemctl restart signalk
 
 ```
 
-
-
 ---
 
 ## Configuration
 
 1. Go to **Plugin Config** in the Signal K side menu.
-2. Select **RaceBox BLE Telemetry Bridge**.
+2. Select **RaceBox BLE Telemetry**.
 3. Turn on the plugin.
-4. **Adaptive Wave Window:** Set your target window length (default: `8` seconds). Shorter windows respond quickly to short chop; longer windows capture deep ocean swells accurately.
-5. Hit **Submit/Save**.
+4. **Calibrate IMU (Optional):** Place your boat level on calm water, check "CALIBRATE IMU" and click Save. The plugin will lock in Pitch & Roll offsets for your boat's installation angle.
+5. **Bluetooth Reset (Emergency):** If the connection locks up, check "RESET BLUETOOTH" and click Save to force-cycle the Bluetooth radio.
+6. Hit **Submit/Save**.
 
 ### Connecting & Resetting
 
-* **Auto-Discovery:** On boot, the plugin scans for any local hardware broadcasting as a RaceBox device. When it finds one, it locks its MAC address permanently into the configuration file so it ignores other devices in a busy marina.
-* **The Reset Switch:** If you swap to a different RaceBox unit on your boat, check the **Reset & Force Scan** box and click **Save**. The plugin will clear its memory, disconnect from the old device, and pair with the new unit immediately.
+* **Auto-Discovery:** On startup, the plugin scans for any local hardware broadcasting as "RaceBox". When found, it locks its MAC address so it reconnects to the same device automatically on restarts.
+* **Manual Recalibration:** While boat is level and floating naturally, check the "CALIBRATE IMU" box and click Save. Roll and Pitch offsets are captured and applied to all future streams.
+* **The Reset Switch:** If you swap to a different RaceBox unit or experience Bluetooth freezing, check the "RESET BLUETOOTH" box and click Save. The plugin will cycle the Linux BLE stack and restart scanning.
 
 ---
 
 ## Signal K Paths Emitted
 
-The plugin outputs data to the following deltas:
+The plugin outputs high-frequency telemetry to the following Signal K paths at 25Hz:
 
-* `navigation.position` (Latitude/Longitude)
-* `navigation.gnss.satellites` (Number of connected satellites)
-* `navigation.courseOverGroundTrue` (Radians)
-* `navigation.speedOverGround` (m/s)
-* `navigation.attitude.roll` (Radians)
-* `navigation.attitude.pitch` (Radians)
-* `environment.wind.waveHeight` (Significant crest-to-trough wave height in meters)
-* `environment.wind.wavePeriod` (Dominant period in seconds)
+### Navigation – Position & Course
+* `navigation.position` — Latitude/Longitude (degrees)
+* `navigation.courseOverGroundTrue` — Heading (radians, 0 = North)
+* `navigation.speedOverGround` — Speed over ground (m/s)
+
+### Navigation – Attitude (Pitch/Roll)
+* `navigation.attitude.roll` — Roll angle (radians, -π/2 to π/2)
+* `navigation.attitude.pitch` — Pitch angle (radians, -π/2 to π/2)
+* `navigation.rateOfTurn` — Turning rate from gyro Z (rad/s)
+
+### Navigation – Raw IMU (6-Axis)
+* `navigation.accel.x` — Accelerometer X (front/back, g)
+* `navigation.accel.y` — Accelerometer Y (side/side, g)
+* `navigation.accel.z` — Accelerometer Z (vertical, g)
+* `navigation.gyro.x` — Gyroscope X (roll rate, rad/s)
+* `navigation.gyro.y` — Gyroscope Y (pitch rate, rad/s)
+
+### Navigation – GNSS/GPS Quality
+* `navigation.gnss.satellites` — Number of satellites with lock
+* `navigation.gnss.horizontalDilution` — Horizontal position error (meters)
+* `navigation.gnss.positionError` — GPS accuracy estimate (meters)
+* `navigation.gnss.type` — GNSS constellation in use (GPS+GLONASS+GALILEO)
+
+### Electrical – Battery
+* `electrical.batteries.racebox.capacity.stateOfCharge` — Battery charge (0 to 1, where 1 = 100%)
+* `electrical.batteries.racebox.voltage` — Battery voltage (Volts)
+
+---
+
+## Troubleshooting
+
+### Plugin Won't Start
+- Verify Bluetooth libraries are installed: `sudo apt-get install bluetooth bluez libbluetooth-dev libudev-dev`
+- Check Node.js permissions: `sudo setcap cap_net_raw,cap_net_admin=+eip $(eval readlink -f \`which node\`)`
+- Verify RaceBox is powered on and broadcasting.
+
+### No Data in Signal K
+- Check the **Provider Status** in Signal K Admin UI for connection state.
+- Use `hciconfig` on Raspberry Pi to confirm Bluetooth adapter is up: `hciconfig`
+- Try the **RESET BLUETOOTH** button in plugin config if connection is stalled.
+
+### Calibration Not Saving
+- Ensure boat is level and stable before pressing "CALIBRATE IMU".
+- Check Signal K server logs for save errors: `sudo journalctl -u signalk -f`
+
+---
+
+## Building & Development
+
+To contribute or extend this plugin:
+
+1. Clone the repository.
+2. Modify `index.js` with your enhancements.
+3. Test locally on a Raspberry Pi running Signal K.
+4. Use the **RESET BLUETOOTH** button to clear state between tests.
+
+The plugin uses the Nordic UART service (UUID `6e400001-b5a3-f393-e0a9-e50e24dcca9e`) for communication, which is industry-standard on many BLE devices.
 
 ---
 
 ## License
 
 MIT License. Feel free to use, modify, and distribute.
-
-```
-
-```
