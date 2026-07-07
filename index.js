@@ -12,6 +12,7 @@ module.exports = function (app) {
   
   let rxBuffer = Buffer.alloc(0);
   let connectedDevice = null;
+  let isConnecting = false; // Core lock to prevent connection overlapping loops
   let messageCount = 0;
   let statusInterval = null;
   let activeOptions = {};
@@ -104,13 +105,14 @@ module.exports = function (app) {
     }
     noble.stopScanning();
     connectedDevice = null;
+    isConnecting = false;
     app.setProviderStatus('Stopped');
   };
 
   // --- 3. BLE Connectivity ---
   function handleBluetoothState(state) {
     if (state === 'poweredOn') {
-      if (!connectedDevice) {
+      if (!connectedDevice && !isConnecting) {
         app.setProviderStatus('Scanning for RaceBox hardware...');
         noble.startScanning([], false); 
       }
@@ -121,11 +123,20 @@ module.exports = function (app) {
   }
 
   function handleDiscovery(peripheral) {
+    // If we are already handling a connection attempt, kill duplicate triggers immediately
+    if (isConnecting || connectedDevice) return;
+
     const name = peripheral.advertisement.localName;
     if (name && name.startsWith('RaceBox')) {
-      app.setProviderStatus(`Found ${name}! Connecting...`);
+      isConnecting = true; 
+      app.setProviderStatus(`Found ${name}! Halting active scan slots...`);
       noble.stopScanning();
-      connectToDevice(peripheral);
+      
+      // Let BlueZ completely clear out the scanning sockets before spinning up connection lines
+      setTimeout(() => {
+        app.setProviderStatus(`Connecting directly to ${name}...`);
+        connectToDevice(peripheral);
+      }, 500);
     }
   }
 
@@ -141,25 +152,22 @@ module.exports = function (app) {
       
       app.setProviderStatus(`Connected to ${peripheral.advertisement.localName}. Waiting for GATT sync...`);
       
-      // Delay discovery by 1000ms to allow local BlueZ link stack to completely stabilize
       setTimeout(() => {
         app.setProviderStatus('Querying all data streams from device...');
         
         peripheral.discoverAllServicesAndCharacteristics((err, services, characteristics) => {
+          // Clear connection lock since discovery successfully wrapped up
+          isConnecting = false; 
+
           if (err) {
             app.setProviderStatus(`Service discovery error: ${err.message}`);
             retryScanning();
             return;
           }
           
-          app.debug(`Discovered ${services?.length || 0} services and ${characteristics?.length || 0} characteristics.`);
-          
-          // Match our target characteristic explicitly
           const txChar = characteristics.find(c => c.uuid.toLowerCase() === RACEBOX_TX_UUID);
           
           if (txChar) {
-            app.setProviderStatus('Subscribing to telemetry stream...');
-            
             txChar.subscribe((subErr) => {
               if (subErr) {
                 app.setProviderStatus(`Subscription error: ${subErr.message}`);
@@ -173,9 +181,7 @@ module.exports = function (app) {
               processIncomingBytes(data);
             });
           } else {
-            const foundUuids = characteristics.map(c => c.uuid).join(', ');
             app.setProviderStatus('Error: Core telemetry stream UUID not found.');
-            app.debug(`Available stream keys on this hardware: ${foundUuids}`);
             retryScanning();
           }
         });
@@ -189,7 +195,11 @@ module.exports = function (app) {
   }
 
   function retryScanning() {
+    if (connectedDevice) {
+      try { connectedDevice.disconnect(); } catch(e) {}
+    }
     connectedDevice = null;
+    isConnecting = false;
     rxBuffer = Buffer.alloc(0);
     if (noble.state === 'poweredOn') {
       noble.startScanning([], false);
