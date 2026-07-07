@@ -12,12 +12,21 @@ module.exports = function (app) {
   const RX_UUID      = '6e400002b5a3f393e0a9e50e24dcca9e'; // Host → Device (write)
   const TX_UUID      = '6e400003b5a3f393e0a9e50e24dcca9e'; // Device → Host (notify/read)
   
+  // Timeouts in ms
+  const CONNECT_TIMEOUT = 10000;
+  const DISCOVER_SERVICES_TIMEOUT = 5000;
+  const DISCOVER_CHARACTERISTICS_TIMEOUT = 5000;
+  const SUBSCRIBE_TIMEOUT = 5000;
+  const SCAN_TIMEOUT = 30000;
+  
   let rxBuffer = Buffer.alloc(0);
   let connectedPeripheral = null;
   let isConnecting = false;
   let calibrationRequested = false;
   let activeOptions = {};
   let dataPacketCount = 0;
+  let scanTimeoutId = null;
+  let connectTimeoutId = null;
 
   // Dynamic config options inside the Signal K Admin UI
   plugin.schema = {
@@ -120,10 +129,30 @@ module.exports = function (app) {
       if (state === 'poweredOn') {
         if (!connectedPeripheral && !isConnecting) {
           app.setProviderStatus('Scanning for RaceBox hardware...');
-          noble.startScanning([], false);
+          // Defer scanning to next tick to avoid blocking Signal K
+          setImmediate(() => {
+            noble.startScanning([], false);
+            
+            // Set scan timeout to prevent indefinite scanning
+            if (scanTimeoutId) clearTimeout(scanTimeoutId);
+            scanTimeoutId = setTimeout(() => {
+              if (debug) app.debug('[RaceBox] Scan timeout - stopping scan');
+              noble.stopScanning();
+              scanTimeoutId = null;
+              // Restart scan after a brief pause
+              setTimeout(() => {
+                if (!connectedPeripheral && !isConnecting) {
+                  app.setProviderStatus('Scan timeout. Restarting scan...');
+                  if (debug) app.debug('[RaceBox] Restarting scan');
+                  setImmediate(() => noble.startScanning([], false));
+                }
+              }, 2000);
+            }, SCAN_TIMEOUT);
+          });
         }
       } else {
         app.setProviderStatus(`Bluetooth radio state: ${state}`);
+        if (scanTimeoutId) clearTimeout(scanTimeoutId);
         noble.stopScanning();
       }
     });
@@ -136,6 +165,11 @@ module.exports = function (app) {
         isConnecting = true;
         app.setProviderStatus(`Found ${localName}! Opening connection channel...`);
         if (debug) app.debug(`[RaceBox] Discovered device: ${localName}`);
+        
+        // Clear scan timeout when device found
+        if (scanTimeoutId) clearTimeout(scanTimeoutId);
+        scanTimeoutId = null;
+        
         noble.stopScanning();
 
         // 500ms delay protects against BlueZ concurrent socket request crashes
@@ -146,7 +180,23 @@ module.exports = function (app) {
     // Fire initial state check manually
     if (noble.state === 'poweredOn') {
       app.setProviderStatus('Scanning for RaceBox hardware...');
-      noble.startScanning([], false);
+      // Defer to next tick
+      setImmediate(() => {
+        noble.startScanning([], false);
+        
+        // Set initial scan timeout
+        if (scanTimeoutId) clearTimeout(scanTimeoutId);
+        scanTimeoutId = setTimeout(() => {
+          if (debug) app.debug('[RaceBox] Initial scan timeout');
+          noble.stopScanning();
+          scanTimeoutId = null;
+          setTimeout(() => {
+            if (!connectedPeripheral && !isConnecting) {
+              setImmediate(() => noble.startScanning([], false));
+            }
+          }, 2000);
+        }, SCAN_TIMEOUT);
+      });
     } else {
       if (debug) app.debug('[RaceBox] Bluetooth not yet powered on, state:', noble.state);
     }
@@ -154,6 +204,10 @@ module.exports = function (app) {
 
   plugin.stop = function () {
     app.setProviderStatus('Stopped');
+    
+    if (scanTimeoutId) clearTimeout(scanTimeoutId);
+    if (connectTimeoutId) clearTimeout(connectTimeoutId);
+    
     noble.removeAllListeners('stateChange');
     noble.removeAllListeners('discover');
     noble.stopScanning();
@@ -167,7 +221,18 @@ module.exports = function (app) {
   function connectToDevice(peripheral) {
     connectedPeripheral = peripheral;
 
+    // Set connection timeout
+    if (connectTimeoutId) clearTimeout(connectTimeoutId);
+    connectTimeoutId = setTimeout(() => {
+      app.setProviderStatus('Connection timeout. Retrying...');
+      if (activeOptions.debugLogging) app.debug('[RaceBox] Connection timeout');
+      cleanupAndRestartScan();
+    }, CONNECT_TIMEOUT);
+
     peripheral.connect((err) => {
+      if (connectTimeoutId) clearTimeout(connectTimeoutId);
+      connectTimeoutId = null;
+
       if (err) {
         app.setProviderStatus(`Link failed: ${err.message}. Retrying...`);
         if (activeOptions.debugLogging) app.debug('[RaceBox] Connection error:', err.message);
@@ -178,8 +243,17 @@ module.exports = function (app) {
       app.setProviderStatus('Connected. Syncing targeted GATT profile...');
       if (activeOptions.debugLogging) app.debug('[RaceBox] Connected to RaceBox device');
 
+      // Set timeout for service discovery
+      let servicesTimeoutId = setTimeout(() => {
+        app.setProviderStatus('Service discovery timeout. Retrying...');
+        if (activeOptions.debugLogging) app.debug('[RaceBox] Service discovery timeout');
+        cleanupAndRestartScan();
+      }, DISCOVER_SERVICES_TIMEOUT);
+
       // Explicitly find ONLY the exact RaceBox Service UUID
       peripheral.discoverServices([SERVICE_UUID], (sErr, services) => {
+        if (servicesTimeoutId) clearTimeout(servicesTimeoutId);
+
         if (sErr || !services || services.length === 0) {
           app.setProviderStatus('Error: Targeted RaceBox service structure not exposed.');
           if (activeOptions.debugLogging) app.debug('[RaceBox] Service discovery error:', sErr);
@@ -189,7 +263,16 @@ module.exports = function (app) {
 
         // Now discover characteristics on the SERVICE, not the peripheral
         const service = services[0];
+        
+        // Set timeout for characteristic discovery
+        let charsTimeoutId = setTimeout(() => {
+          app.setProviderStatus('Characteristic discovery timeout. Retrying...');
+          if (activeOptions.debugLogging) app.debug('[RaceBox] Characteristic discovery timeout');
+          cleanupAndRestartScan();
+        }, DISCOVER_CHARACTERISTICS_TIMEOUT);
+
         service.discoverCharacteristics([TX_UUID, RX_UUID], (cErr, characteristics) => {
+          if (charsTimeoutId) clearTimeout(charsTimeoutId);
           isConnecting = false; 
 
           if (cErr || !characteristics) {
@@ -215,7 +298,17 @@ module.exports = function (app) {
 
           // Subscribe to TX (device → host data stream)
           app.setProviderStatus('Subscribing to 25Hz telemetry stream...');
+          
+          // Set timeout for subscription
+          let subTimeoutId = setTimeout(() => {
+            app.setProviderStatus('Subscription timeout. Retrying...');
+            if (activeOptions.debugLogging) app.debug('[RaceBox] Subscription timeout');
+            cleanupAndRestartScan();
+          }, SUBSCRIBE_TIMEOUT);
+
           txChar.subscribe((subErr) => {
+            if (subTimeoutId) clearTimeout(subTimeoutId);
+
             if (subErr) {
               app.setProviderStatus(`Subscription denied: ${subErr.message}`);
               if (activeOptions.debugLogging) app.debug('[RaceBox] Subscribe error:', subErr.message);
@@ -248,14 +341,36 @@ module.exports = function (app) {
     connectedPeripheral = null;
     isConnecting = false;
     rxBuffer = Buffer.alloc(0);
+    
     if (noble.state === 'poweredOn') {
-      noble.startScanning([], false);
+      // Defer restart to next tick
+      setImmediate(() => {
+        noble.startScanning([], false);
+        
+        // Set scan timeout
+        if (scanTimeoutId) clearTimeout(scanTimeoutId);
+        scanTimeoutId = setTimeout(() => {
+          if (activeOptions.debugLogging) app.debug('[RaceBox] Recovery scan timeout');
+          noble.stopScanning();
+          scanTimeoutId = null;
+          setTimeout(() => {
+            if (!connectedPeripheral && !isConnecting) {
+              setImmediate(() => noble.startScanning([], false));
+            }
+          }, 2000);
+        }, SCAN_TIMEOUT);
+      });
     }
   }
 
   // --- Stream Buffer Re-assembly Pipeline ---
   function processIncomingBytes(chunk) {
     rxBuffer = Buffer.concat([rxBuffer, chunk]);
+
+    // Yield to event loop every 100 packets to keep Signal K responsive
+    if (dataPacketCount % 100 === 0) {
+      setImmediate(() => {});
+    }
 
     while (rxBuffer.length >= 6) {
       if (rxBuffer[0] !== 0xB5 || rxBuffer[1] !== 0x62) {
