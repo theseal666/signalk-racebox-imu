@@ -53,7 +53,6 @@ module.exports = function (app) {
     app.debug('RaceBox plugin starting...');
     activeOptions = options || { enableIMU: true, calibrationOffsets: { pitch: 0, roll: 0, yawRate: 0 } };
 
-    // Handle Bluetooth Reset Action
     if (activeOptions.triggerBleReset) {
       app.setProviderStatus('Executing hard Bluetooth interface cycle...');
       activeOptions.triggerBleReset = false;
@@ -66,7 +65,6 @@ module.exports = function (app) {
       return; 
     }
 
-    // Set Calibration Flag if requested
     if (activeOptions.triggerCalibration) {
       performCalibrationNextPacket = true;
       app.setProviderStatus('Awaiting next telemetry frame to calibrate...');
@@ -74,14 +72,12 @@ module.exports = function (app) {
       app.setProviderStatus('Initializing Bluetooth discovery...');
     }
 
-    // Clean up older listeners from the global singleton before rebinding
     noble.removeAllListeners('stateChange');
     noble.removeAllListeners('discover');
 
     noble.on('stateChange', handleBluetoothState);
     noble.on('discover', handleDiscovery);
 
-    // Initial state trigger
     handleBluetoothState(noble.state);
 
     statusInterval = setInterval(() => {
@@ -143,26 +139,33 @@ module.exports = function (app) {
         return;
       }
       
-      app.setProviderStatus(`Connected to ${peripheral.advertisement.localName}. Locating custom characteristics...`);
+      app.setProviderStatus(`Connected to ${peripheral.advertisement.localName}. Waiting for GATT sync...`);
       
-      peripheral.discoverSomeServicesAndCharacteristics(
-        [RACEBOX_SERVICE_UUID],
-        [RACEBOX_TX_UUID],
-        (err, services, characteristics) => {
+      // Delay discovery by 1000ms to allow local BlueZ link stack to completely stabilize
+      setTimeout(() => {
+        app.setProviderStatus('Querying all data streams from device...');
+        
+        peripheral.discoverAllServicesAndCharacteristics((err, services, characteristics) => {
           if (err) {
             app.setProviderStatus(`Service discovery error: ${err.message}`);
             retryScanning();
             return;
           }
           
-          const txChar = characteristics.find(c => c.uuid === RACEBOX_TX_UUID);
+          app.debug(`Discovered ${services?.length || 0} services and ${characteristics?.length || 0} characteristics.`);
+          
+          // Match our target characteristic explicitly
+          const txChar = characteristics.find(c => c.uuid.toLowerCase() === RACEBOX_TX_UUID);
+          
           if (txChar) {
+            app.setProviderStatus('Subscribing to telemetry stream...');
+            
             txChar.subscribe((subErr) => {
               if (subErr) {
                 app.setProviderStatus(`Subscription error: ${subErr.message}`);
                 retryScanning();
               } else {
-                app.setProviderStatus('Subscribed to telemetry stream successfully.');
+                app.setProviderStatus('Streaming live data successfully.');
               }
             });
             
@@ -170,11 +173,13 @@ module.exports = function (app) {
               processIncomingBytes(data);
             });
           } else {
-            app.setProviderStatus('Error: Expected RaceBox telemetry characteristics not found.');
+            const foundUuids = characteristics.map(c => c.uuid).join(', ');
+            app.setProviderStatus('Error: Core telemetry stream UUID not found.');
+            app.debug(`Available stream keys on this hardware: ${foundUuids}`);
             retryScanning();
           }
-        }
-      );
+        });
+      }, 1000);
     });
 
     peripheral.on('disconnect', () => {
@@ -238,22 +243,17 @@ module.exports = function (app) {
 
     const values = [];
 
-    // --- Part A: Handle IMU (Always stream this independent of GNSS fix!) ---
     if (activeOptions.enableIMU) {
-      // G-Forces scaled down to unit g from milli-g[cite: 1]
       const gX = payload.readInt16LE(40) / 1000; 
       const gY = payload.readInt16LE(42) / 1000; 
       const gZ = payload.readInt16LE(44) / 1000; 
 
-      // Rotation rates converted from centi-deg/s to radians/s[cite: 1]
       const rotZ = (payload.readInt16LE(50) / 100) * (Math.PI / 180); 
 
-      // Derive Pitch and Roll angles using standard trigonometry on the raw accelerometers
       const rawRoll = Math.atan2(gY, gZ);
       const rawPitch = Math.atan2(-gX, Math.sqrt(gY * gY + gZ * gZ));
       const rawYawRate = rotZ; 
 
-      // If calibration checkbox was marked, capture current static baseline values immediately
       if (performCalibrationNextPacket) {
         performCalibrationNextPacket = false;
         activeOptions.triggerCalibration = false;
@@ -264,13 +264,11 @@ module.exports = function (app) {
         });
       }
 
-      // Apply calibration adjustment offsets
       const offsets = activeOptions.calibrationOffsets || { pitch: 0, roll: 0, yawRate: 0 };
       const calibratedRoll = rawRoll - (offsets.roll || 0);
       const calibratedPitch = rawPitch - (offsets.pitch || 0);
       const calibratedYawRate = rawYawRate - (offsets.yawRate || 0);
 
-      // Push IMU telemetry to standard Signal K paths
       values.push(
         { path: 'navigation.attitude.roll', value: calibratedRoll },
         { path: 'navigation.attitude.pitch', value: calibratedPitch },
@@ -281,7 +279,6 @@ module.exports = function (app) {
       );
     }
 
-    // --- Part B: Handle GNSS Mapping (Conditional on valid position fix) ---
     const fixStatus = payload.readUInt8(14); 
     if (fixStatus >= 2) { 
       const lat = payload.readInt32LE(16) / 10000000;
@@ -301,7 +298,6 @@ module.exports = function (app) {
       );
     }
 
-    // Emit live delta batch to Data Browser pipeline
     if (values.length > 0) {
       app.handleMessage(plugin.id, {
         updates: [
