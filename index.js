@@ -346,7 +346,10 @@ module.exports = function (app) {
       });
     });
 
-    peripheral.on('disconnect', () => {
+    // Use removeAllListeners + once so repeated connect cycles on the same
+    // peripheral object don't accumulate duplicate disconnect handlers
+    peripheral.removeAllListeners('disconnect');
+    peripheral.once('disconnect', () => {
       app.setProviderStatus('Device link severed. Searching for hardware...');
       if (debug) app.debug('[RaceBox] Device disconnected unexpectedly');
       cleanupAndRestartScan();
@@ -466,13 +469,15 @@ module.exports = function (app) {
     const values = [];
 
     // 1. Raw 6-Axis IMU Sensor Channels
-    const accelX = payload.readInt16LE(40) / 1000;
-    const accelY = payload.readInt16LE(42) / 1000;
-    const accelZ = payload.readInt16LE(44) / 1000;
+    // GForce X/Y/Z: Int16 at offsets 68/70/72, in milli-g (divide by 1000 for g)
+    const accelX = payload.readInt16LE(68) / 1000;
+    const accelY = payload.readInt16LE(70) / 1000;
+    const accelZ = payload.readInt16LE(72) / 1000;
 
-    const gyroX = (payload.readInt16LE(46) / 100) * (Math.PI / 180);
-    const gyroY = (payload.readInt16LE(48) / 100) * (Math.PI / 180);
-    const gyroZ = (payload.readInt16LE(50) / 100) * (Math.PI / 180);
+    // Rotation rate X/Y/Z: Int16 at offsets 74/76/78, in centi-deg/s (X=roll, Y=pitch, Z=yaw)
+    const gyroX = (payload.readInt16LE(74) / 100) * (Math.PI / 180);
+    const gyroY = (payload.readInt16LE(76) / 100) * (Math.PI / 180);
+    const gyroZ = (payload.readInt16LE(78) / 100) * (Math.PI / 180);
 
     if (debug && dataPacketCount === 1) {
       app.debug('[RaceBox] Packet 1: accelX=', accelX, 'accelY=', accelY, 'accelZ=', accelZ);
@@ -521,42 +526,45 @@ module.exports = function (app) {
     );
 
     // 2. Read System State Metrics
-    const batteryPercent = payload.readUInt8(52);
-    const batteryRaw = payload.readUInt16LE(53);
-    const batteryVoltage = batteryRaw / 1000;
-    
+    // Byte 67: for Mini/MiniS, bit 7 = charging flag, bits 0-6 = battery level in percent.
+    // (For RaceBox Micro this byte is input voltage x10 instead - no battery.)
+    const batteryByte = payload.readUInt8(67);
+    const isCharging = (batteryByte & 0x80) !== 0;
+    const batteryPercent = batteryByte & 0x7F;
+
     values.push(
       { 
         path: 'electrical.batteries.racebox.capacity.stateOfCharge', 
         value: batteryPercent / 100 
       },
       {
-        path: 'electrical.batteries.racebox.voltage',
-        value: batteryVoltage
+        path: 'electrical.batteries.racebox.chargingMode',
+        value: isCharging ? 'charging' : 'not charging'
       }
     );
 
     // 3. High-Performance GNSS Engine Extraction
-    const fixStatus = payload.readUInt8(14); 
-    const satellitesConnected = payload.readUInt8(15);
-    const positionAccuracyMm = payload.readUInt32LE(36);
-    const positionAccuracyM = positionAccuracyMm / 1000;
+    const fixStatus = payload.readUInt8(20);       // 0 = no fix, 2 = 2D, 3 = 3D
+    const fixStatusFlags = payload.readUInt8(21);  // bit 0 = valid fix
+    const satellitesConnected = payload.readUInt8(23);
+    const horizontalAccuracyM = payload.readUInt32LE(40) / 1000; // mm -> m
+    const pdop = payload.readUInt16LE(64) / 100;
 
     values.push(
       { path: 'navigation.gnss.satellites', value: satellitesConnected },
-      { path: 'navigation.gnss.horizontalDilution', value: positionAccuracyM },
-      { path: 'navigation.gnss.positionError', value: positionAccuracyM }
+      { path: 'navigation.gnss.horizontalDilution', value: pdop },
+      { path: 'navigation.gnss.positionError', value: horizontalAccuracyM }
     );
 
-    // Only broadcast tracking and position vectors if a live 2D/3D fix exists
-    if (fixStatus >= 2) { 
-      const lat = payload.readInt32LE(16) / 10000000;
-      const lon = payload.readInt32LE(20) / 10000000;
+    // Only broadcast tracking and position vectors if a live, valid 2D/3D fix exists
+    if (fixStatus >= 2 && (fixStatusFlags & 0x01)) { 
+      const lon = payload.readInt32LE(24) / 10000000;
+      const lat = payload.readInt32LE(28) / 10000000;
 
-      const speedMms = payload.readUInt32LE(28); 
+      const speedMms = payload.readInt32LE(48); // mm/s
       const speedMs = speedMms / 1000;          
       
-      const headingDegreesScaled = payload.readInt32LE(32); 
+      const headingDegreesScaled = payload.readInt32LE(52); // degrees x 100000
       const headingRad = (headingDegreesScaled / 100000) * (Math.PI / 180); 
 
       values.push(
