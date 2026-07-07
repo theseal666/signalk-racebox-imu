@@ -5,6 +5,21 @@ module.exports = function (app) {
   let timer = null;
   let connectedDevice = null;
 
+  // Variables to hold live telemetry parsed from your BLE buffer streams
+  let liveTelemetry = {
+    latitude: null,
+    longitude: null,
+    satellites: 0,
+    gpsAccuracy: null, // Horizontal accuracy in meters
+    cog: null,         // Course Over Ground in Radians
+    sog: null,         // Speed Over Ground in m/s
+    roll: 0.0,         // Radians
+    pitch: 0.0,        // Radians
+    waveHeight: 0.0,   // Meters
+    wavePeriod: 0.0,   // Seconds
+    batteryVoltage: 0.0
+  };
+
   plugin.id = 'signalk-racebox-imu';
   plugin.name = 'Racebox IMU';
   plugin.description = 'Auto-discovers and connects to a RaceBox Mini or Micro over BLE, supporting IMU data, battery voltage monitoring, and gyro calibration.';
@@ -49,7 +64,7 @@ module.exports = function (app) {
     // Track runtime options
     let targetMac = options.lockDeviceMac ? options.lockDeviceMac.toLowerCase().trim() : null;
 
-    // Data parsing tracking loop
+    // Data dispatching loop sending updates to Signal K core
     timer = setInterval(() => {
       if (connectedDevice) {
         app.setProviderStatus(`Streaming 25Hz telemetry from linked RaceBox [${connectedDevice.address}]`);
@@ -57,30 +72,41 @@ module.exports = function (app) {
         app.setProviderStatus(targetMac ? `Targeting locked device [${targetMac}]...` : 'Scanning for closest RaceBox Mini/Micro...');
       }
 
-      // --- TELEMETRY INGESTION ---
-      let sampleBatteryVoltage = 3.95;   // 3.95 Volts
-      let samplePitch = 0.02;            // Radians
-      let sampleRoll = -0.05;            // Radians
+      // Build the values array dynamically, omitting paths if GPS fix is lost (null)
+      let valuesArray = [
+        { path: 'electrical.batteries.racebox.voltage', value: liveTelemetry.batteryVoltage },
+        { path: 'navigation.attitude.pitch', value: liveTelemetry.pitch },
+        { path: 'navigation.attitude.roll', value: liveTelemetry.roll },
+        { path: 'environment.wind.waveHeight', value: liveTelemetry.waveHeight },
+        { path: 'environment.wind.wavePeriod', value: liveTelemetry.wavePeriod }
+      ];
+
+      // Only push GPS telemetry paths if we have a valid structural fix data payload
+      if (liveTelemetry.latitude !== null && liveTelemetry.longitude !== null) {
+        valuesArray.push({
+          path: 'navigation.position',
+          value: { latitude: liveTelemetry.latitude, longitude: liveTelemetry.longitude }
+        });
+      }
+      if (liveTelemetry.satellites !== null) {
+        valuesArray.push({ path: 'navigation.gnss.satellites', value: liveTelemetry.satellites });
+      }
+      if (liveTelemetry.gpsAccuracy !== null) {
+        valuesArray.push({ path: 'navigation.gnss.horizontalAccuracy', value: liveTelemetry.gpsAccuracy });
+      }
+      if (liveTelemetry.cog !== null) {
+        valuesArray.push({ path: 'navigation.courseOverGroundTrue', value: liveTelemetry.cog });
+      }
+      if (liveTelemetry.sog !== null) {
+        valuesArray.push({ path: 'navigation.speedOverGround', value: liveTelemetry.sog });
+      }
 
       let delta = {
         updates: [
           {
             source: { label: plugin.id },
             timestamp: new Date().toISOString(),
-            values: [
-              {
-                path: 'electrical.batteries.racebox.voltage',
-                value: sampleBatteryVoltage
-              },
-              {
-                path: 'navigation.attitude.pitch',
-                value: samplePitch
-              },
-              {
-                path: 'navigation.attitude.roll',
-                value: sampleRoll
-              }
-            ]
+            values: valuesArray
           }
         ]
       };
@@ -121,6 +147,14 @@ module.exports = function (app) {
             }
             
             app.setProviderStatus(`Connected to ${name} (${peripheral.address})! Streaming telemetry...`);
+            
+            // ➡️ NOTE: INSIDE YOUR NOBLE CHARACTERISTIC NOTIFICATION CALLBACK LOOP:
+            // Parse your raw byte arrays and update the 'liveTelemetry' object parameters directly!
+            // Example:
+            // liveTelemetry.pitch = parsedPitchInRadians;
+            // liveTelemetry.latitude = parsedLatitudeDegrees;
+            // liveTelemetry.satellites = parsedSatCountByte;
+            // liveTelemetry.gpsAccuracy = parsedAccuracyInMeters;
           });
 
           peripheral.on('disconnect', () => {
