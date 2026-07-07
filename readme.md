@@ -1,81 +1,83 @@
 # signalk-racebox-imu
 
-A Signal K plugin to auto-discover, pair, and stream telemetry from a **RaceBox Mini** or **RaceBox Micro** over Bluetooth Low Energy (BLE). 
+A Signal K plugin to auto-discover, connect, and stream telemetry from a **RaceBox Mini**, **RaceBox Mini S**, or **RaceBox Micro** over Bluetooth Low Energy (BLE).
 
-This plugin extracts high-frequency IMU and GNSS data directly from the proprietary RaceBox binary stream and converts it into standard Signal K paths. Streams at 25Hz with full 6-axis IMU (accelerometer + gyroscope), GPS/GNSS position, course/speed, battery voltage monitoring, and satellite tracking.
+This plugin parses the RaceBox binary protocol (UBX-framed, per the official *RaceBox BLE Protocol Description rev 8*) and converts it into standard Signal K paths. Streams at 25Hz with full 6-axis IMU (accelerometer + gyroscope), GPS/GNSS position, course/speed, battery monitoring, and satellite tracking.
+
+Bluetooth connectivity is handled by [`node-ble`](https://github.com/chrvadala/node-ble), which talks to the standard Linux BlueZ daemon over D-Bus — no native modules, no raw HCI access, and no conflicts with the system Bluetooth stack.
 
 ---
 
 ## Features
-* **Zero Configuration Pairing:** Auto-discovers and pairs with the first available RaceBox device—no MAC addresses to find or type.
-* **Full Telemetry Mapping:** Extracts Position, SOG, COG, Pitch, Roll, Satellite Count, Battery Voltage, and GPS Accuracy.
-* **6-Axis IMU Streaming:** Outputs raw accelerometer (X/Y/Z) and gyroscope (X/Y/Z) data at 25Hz for high-precision navigation and motion analysis.
-* **GPS Quality Metrics:** Reports number of satellites, horizontal position error, and fix status.
-* **Battery Monitoring:** Real-time battery percentage and voltage tracking.
-* **In-App Calibration:** Zero out Pitch & Roll offsets while boat is level—saved to config for future sessions.
-* **Hardware Reset Control:** One-click Bluetooth radio reset from Signal K Admin UI to clear connection lockups.
-* **App Store Native:** Integrates smoothly into the Signal K Admin UI with live connection logging and status updates.
+* **Zero Configuration Pairing:** Auto-discovers and connects to the first device advertising as "RaceBox" — no MAC addresses to find or type.
+* **Full Telemetry Mapping:** Position, SOG, COG, Pitch, Roll, satellite count, battery status, and GPS accuracy.
+* **6-Axis IMU Streaming:** Raw accelerometer (X/Y/Z) and gyroscope (X/Y/Z) data at 25Hz.
+* **Validated Protocol Parser:** Field offsets verified against the reference packet in the official RaceBox protocol documentation (rev 8).
+* **Fix-Aware Position Gating:** Position, SOG, and COG are only published when the receiver reports a valid 2D/3D fix, so you never get bogus coordinates during satellite acquisition.
+* **In-App Calibration:** Zero out Pitch & Roll offsets while the boat is level — saved to config for future sessions.
+* **Self-Healing Connection:** Automatic reconnect with backoff, plus a data-staleness watchdog that tears down and re-establishes a silent connection.
+* **Bluetooth Reset Control:** One-click restart of the system Bluetooth service from the Signal K Admin UI.
 
 ---
 
 ## Prerequisites & System Dependencies
 
-Because this plugin utilizes Bluetooth Low Energy (`@abandonware/noble`), the host system (e.g., Raspberry Pi) requires specific Bluetooth libraries and permissions.
+The plugin uses the standard Linux Bluetooth stack (BlueZ) via D-Bus. On Raspberry Pi OS everything needed ships by default — you just need to make sure it's enabled, and grant the Signal K user D-Bus access.
 
-### 1. Install System Packages
-Run the following command on your Raspberry Pi terminal to install the necessary BLE development libraries:
-
-```bash
-sudo apt-get install bluetooth bluez libbluetooth-dev libudev-dev
-
-```
-
-### 2. Grant Permissions to Node.js (Crucial for Raspberry Pi)
-
-By default, Linux prevents non-root applications (like the Node.js process running Signal K) from accessing the Bluetooth controller interface. Grant the required permissions by running:
+### 1. Ensure BlueZ is installed and running
 
 ```bash
-sudo setcap cap_net_raw,cap_net_admin=+eip $(eval readlink -f `which node`)
-
+sudo apt-get install bluetooth bluez
+sudo systemctl enable --now bluetooth
+bluetoothctl power on
 ```
 
-*Note: If you update Node.js on your system in the future, you will need to re-run this command.*
+> **Note:** If you previously disabled the Bluetooth service to accommodate a noble-based plugin (including older versions of this one), re-enable it — this plugin *requires* `bluetoothd` running.
+
+### 2. Grant D-Bus permission to the Signal K user (one-time)
+
+Linux restricts which users may talk to the Bluetooth daemon. Create a D-Bus policy for the user that runs Signal K (commonly `pi`, or your login user — check with `ps -o user= -p $(pgrep -f signalk-server | head -1)`):
+
+```bash
+sudo tee /etc/dbus-1/system.d/signalk-ble.conf > /dev/null <<'EOF'
+<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-BUS Bus Configuration 1.0//EN"
+  "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
+<busconfig>
+  <policy user="YOUR_SIGNALK_USER">
+    <allow own="org.bluez"/>
+    <allow send_destination="org.bluez"/>
+    <allow send_interface="org.bluez.GattCharacteristic1"/>
+    <allow send_interface="org.bluez.GattDescriptor1"/>
+    <allow send_interface="org.freedesktop.DBus.ObjectManager"/>
+    <allow send_interface="org.freedesktop.DBus.Properties"/>
+  </policy>
+</busconfig>
+EOF
+sudo systemctl reload dbus
+```
+
+Replace `YOUR_SIGNALK_USER` with the actual username.
+
+> Unlike noble-based plugins, **no `setcap` on the node binary is required**, and the permissions survive Node.js upgrades.
 
 ---
 
 ## Installation
 
-### Method 1: Via Signal K App Store (Recommended for Production)
-
-Once published, this is the seamless approach for end-users:
+### Method 1: Via Signal K App Store (Recommended)
 
 1. Log into your **Signal K Admin Console**.
-2. Navigate to **Appstore** -> **Available**.
+2. Navigate to **Appstore** → **Available**.
 3. Search for `signalk-racebox-imu`.
 4. Click **Install**.
 5. Restart your Signal K server when prompted.
 
 ### Method 2: Manual Installation (For Development / Testing)
 
-If you are testing this code from GitHub before it is officially on the App Store:
-
-1. SSH into your Raspberry Pi.
-2. Navigate to your Signal K data directory (usually `~/.signalk`):
 ```bash
 cd ~/.signalk
-
-```
-
-3. Install the plugin directly from your GitHub repository:
-```bash
-npm install https://github.com/theseal666/signalk-racebox-imu.git
-
-```
-
-4. Restart your Signal K server:
-```bash
+npm install github:theseal666/signalk-racebox-imu
 sudo systemctl restart signalk
-
 ```
 
 ---
@@ -85,79 +87,79 @@ sudo systemctl restart signalk
 1. Go to **Plugin Config** in the Signal K side menu.
 2. Select **RaceBox BLE Telemetry**.
 3. Turn on the plugin.
-4. **Calibrate IMU (Optional):** Place your boat level on calm water, check "CALIBRATE IMU" and click Save. The plugin will lock in Pitch & Roll offsets for your boat's installation angle.
-5. **Bluetooth Reset (Emergency):** If the connection locks up, check "RESET BLUETOOTH" and click Save to force-cycle the Bluetooth radio.
-6. Hit **Submit/Save**.
+4. **Calibrate IMU (Optional):** Place your boat level on calm water, check "CALIBRATE IMU" and click Save. The plugin captures Pitch & Roll offsets for your installation angle from the next data packet.
+5. **Bluetooth Reset (Emergency):** If the connection locks up, check "RESET BLUETOOTH" and click Save to restart the system Bluetooth service.
 
-### Connecting & Resetting
+### Good to know
 
-* **Auto-Discovery:** On startup, the plugin scans for any local hardware broadcasting as "RaceBox". When found, it locks its MAC address so it reconnects to the same device automatically on restarts.
-* **Manual Recalibration:** While boat is level and floating naturally, check the "CALIBRATE IMU" box and click Save. Roll and Pitch offsets are captured and applied to all future streams.
-* **The Reset Switch:** If you swap to a different RaceBox unit or experience Bluetooth freezing, check the "RESET BLUETOOTH" box and click Save. The plugin will cycle the Linux BLE stack and restart scanning.
+* **One central at a time:** A RaceBox accepts only one BLE connection. Close the RaceBox phone app (fully — not backgrounded) or it will steal the connection from the server.
+* **Standalone recording (Mini S / Micro):** If the device is set to record at a lower rate (e.g. 1Hz), live BLE data arrives at that reduced rate too. During a memory download or erase, live data is silenced entirely.
+* **No position at startup indoors:** Position/SOG/COG are gated on a valid GNSS fix. IMU and battery data flow immediately; navigation data appears once the green (fix) LED is on.
 
 ---
 
 ## Signal K Paths Emitted
 
-The plugin outputs high-frequency telemetry to the following Signal K paths at 25Hz:
+At up to 25Hz:
 
-### Navigation – Position & Course
+### Navigation – Position & Course *(only with a valid 2D/3D fix)*
 * `navigation.position` — Latitude/Longitude (degrees)
-* `navigation.courseOverGroundTrue` — Heading (radians, 0 = North)
+* `navigation.courseOverGroundTrue` — Course over ground (radians, 0 = North)
 * `navigation.speedOverGround` — Speed over ground (m/s)
+* `navigation.gnss.type` — GNSS constellation in use
 
 ### Navigation – Attitude (Pitch/Roll)
-* `navigation.attitude.roll` — Roll angle (radians, -π/2 to π/2)
-* `navigation.attitude.pitch` — Pitch angle (radians, -π/2 to π/2)
-* `navigation.rateOfTurn` — Turning rate from gyro Z (rad/s)
+* `navigation.attitude.roll` — Roll angle (radians), calibration offset applied
+* `navigation.attitude.pitch` — Pitch angle (radians), calibration offset applied
+* `navigation.rateOfTurn` — Turning rate from gyro Z / yaw (rad/s)
 
 ### Navigation – Raw IMU (6-Axis)
 * `navigation.accel.x` — Accelerometer X (front/back, g)
-* `navigation.accel.y` — Accelerometer Y (side/side, g)
-* `navigation.accel.z` — Accelerometer Z (vertical, g)
+* `navigation.accel.y` — Accelerometer Y (right/left, g)
+* `navigation.accel.z` — Accelerometer Z (up/down, g)
 * `navigation.gyro.x` — Gyroscope X (roll rate, rad/s)
 * `navigation.gyro.y` — Gyroscope Y (pitch rate, rad/s)
 
 ### Navigation – GNSS/GPS Quality
-* `navigation.gnss.satellites` — Number of satellites with lock
-* `navigation.gnss.horizontalDilution` — Horizontal position error (meters)
-* `navigation.gnss.positionError` — GPS accuracy estimate (meters)
-* `navigation.gnss.type` — GNSS constellation in use (GPS+GLONASS+GALILEO)
+* `navigation.gnss.satellites` — Number of space vehicles used in the solution
+* `navigation.gnss.horizontalDilution` — PDOP (dimensionless)
+* `navigation.gnss.positionError` — Horizontal accuracy estimate (meters)
 
 ### Electrical – Battery
-* `electrical.batteries.racebox.capacity.stateOfCharge` — Battery charge (0 to 1, where 1 = 100%)
-* `electrical.batteries.racebox.voltage` — Battery voltage (Volts)
+* `electrical.batteries.racebox.capacity.stateOfCharge` — Battery level (0 to 1)
+* `electrical.batteries.racebox.chargingMode` — `charging` / `not charging`
+
+> **RaceBox Micro note:** The Micro has no battery — the underlying protocol byte reports input voltage instead. The stateOfCharge value is not meaningful on a Micro.
 
 ---
 
 ## Troubleshooting
 
-### Plugin Won't Start
-- Verify Bluetooth libraries are installed: `sudo apt-get install bluetooth bluez libbluetooth-dev libudev-dev`
-- Check Node.js permissions: `sudo setcap cap_net_raw,cap_net_admin=+eip $(eval readlink -f \`which node\`)`
-- Verify RaceBox is powered on and broadcasting.
+### Plugin Won't Start / "Bluetooth adapter init timed out"
+- Confirm the Bluetooth service is running: `systemctl status bluetooth`
+- Confirm the adapter is powered: `bluetoothctl show` (look for `Powered: yes`)
+- Confirm the D-Bus policy (Prerequisites step 2) exists and names the correct user, then `sudo systemctl reload dbus` and restart Signal K.
 
-### No Data in Signal K
-- Check the **Provider Status** in Signal K Admin UI for connection state.
-- Use `hciconfig` on Raspberry Pi to confirm Bluetooth adapter is up: `hciconfig`
-- Try the **RESET BLUETOOTH** button in plugin config if connection is stalled.
+### Scanning Never Finds the RaceBox
+- Verify the device is advertising: its blue LED should be **flashing**. A **solid** blue LED means something else is already connected to it (often the RaceBox phone app) — a connected RaceBox stops advertising.
+- Check it's visible to the OS: `bluetoothctl scan on` should list `RaceBox Mini/Micro <serial>`.
+
+### Connected But No Data
+- Check **Provider Status** in the plugin config page and the server log: `sudo journalctl -u signalk -f | grep RaceBox`
+- The plugin's watchdog automatically reconnects if data stalls for 15 seconds — persistent stall/reconnect cycles usually indicate another client fighting for the device.
+- Try the **RESET BLUETOOTH** button in plugin config.
 
 ### Calibration Not Saving
-- Ensure boat is level and stable before pressing "CALIBRATE IMU".
-- Check Signal K server logs for save errors: `sudo journalctl -u signalk -f`
+- Ensure the boat is level and stable, and that data is actively streaming, before checking "CALIBRATE IMU" — the offsets are captured from the next live packet.
+- Check the server log for save errors.
 
 ---
 
-## Building & Development
+## Development
 
-To contribute or extend this plugin:
-
-1. Clone the repository.
-2. Modify `index.js` with your enhancements.
-3. Test locally on a Raspberry Pi running Signal K.
-4. Use the **RESET BLUETOOTH** button to clear state between tests.
-
-The plugin uses the Nordic UART service (UUID `6e400001-b5a3-f393-e0a9-e50e24dcca9e`) for communication, which is industry-standard on many BLE devices.
+1. Clone the repository, modify `index.js`, test on a Pi running Signal K (`npm install <path-or-git-url>` in `~/.signalk`).
+2. The RaceBox protocol: UBX-framed packets (`0xB5 0x62`) over the Nordic UART service (`6e400001-b5a3-f393-e0a9-e50e24dcca9e`), TX characteristic notifications, Fletcher-8 checksum. The 80-byte `0xFF 0x01` data message layout is implemented in `parseRaceBoxData()` and matches the official *RaceBox BLE Protocol Description rev 8*.
+3. Packets may be split or merged across BLE notifications — the reassembly buffer in `processIncomingBytes()` handles this.
 
 ---
 
