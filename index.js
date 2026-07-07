@@ -287,19 +287,30 @@ module.exports = function (app) {
 
     // 2. Read System State Metrics
     const batteryPercent = payload.readUInt8(52); // Battery level %
-    values.push({ 
-      path: 'electrical.batteries.racebox.capacity.stateOfCharge', 
-      value: batteryPercent / 100 
-    });
+    const batteryRaw = payload.readUInt16LE(53);   // Battery voltage (raw, usually mV)
+    const batteryVoltage = batteryRaw / 1000;      // Convert to Volts
+    
+    values.push(
+      { 
+        path: 'electrical.batteries.racebox.capacity.stateOfCharge', 
+        value: batteryPercent / 100 
+      },
+      {
+        path: 'electrical.batteries.racebox.voltage',
+        value: batteryVoltage
+      }
+    );
 
     // 3. High-Performance GNSS Engine Extraction
     const fixStatus = payload.readUInt8(14); 
     const satellitesConnected = payload.readUInt8(15);
     const positionAccuracyMm = payload.readUInt32LE(36); // Horizontal Accuracy (mm)
+    const positionAccuracyM = positionAccuracyMm / 1000;  // Convert to meters
 
     values.push(
       { path: 'navigation.gnss.satellites', value: satellitesConnected },
-      { path: 'navigation.gnss.horizontalDilution', value: positionAccuracyMm / 1000 } // Expose in meters
+      { path: 'navigation.gnss.horizontalDilution', value: positionAccuracyM },
+      { path: 'navigation.gnss.positionError', value: positionAccuracyM } // GPS error in meters
     );
 
     // Only broadcast tracking and position vectors if a live 2D/3D fix exists
