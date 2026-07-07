@@ -6,9 +6,9 @@ module.exports = function (app) {
   plugin.name = 'RaceBox BLE Telemetry';
   plugin.description = 'Streams high-frequency GNSS and IMU data from RaceBox Mini/S/Micro into Signal K';
 
-  // Core RaceBox Protocol Constants[cite: 1]
-  const RACEBOX_SERVICE_UUID = '6e400001b5a3f393e0a9e50e24dcca9e'; // Custom UART Service[cite: 1]
-  const RACEBOX_TX_UUID = '6e400003b5a3f393e0a9e50e24dcca9e';      // Notify Characteristic[cite: 1]
+  // Core RaceBox Protocol Constants
+  const RACEBOX_SERVICE_UUID = '6e400001b5a3f393e0a9e50e24dcca9e'; 
+  const RACEBOX_TX_UUID = '6e400003b5a3f393e0a9e50e24dcca9e';      
   
   let rxBuffer = Buffer.alloc(0);
   let connectedDevice = null;
@@ -26,7 +26,6 @@ module.exports = function (app) {
     });
 
     noble.on('discover', (peripheral) => {
-      // Look for RaceBox broadcast names[cite: 1]
       if (peripheral.advertisement.localName && peripheral.advertisement.localName.startsWith('RaceBox')) {
         app.debug(`Found device: ${peripheral.advertisement.localName}`);
         noble.stopScanning();
@@ -69,7 +68,6 @@ module.exports = function (app) {
               if (subErr) app.error(`Subscription failed: ${subErr}`);
             });
             
-            // Handle raw incoming stream data chunk by chunk[cite: 1]
             txChar.on('data', (data, isNotification) => {
               processIncomingBytes(data);
             });
@@ -85,40 +83,35 @@ module.exports = function (app) {
     });
   }
 
-  // FIFO Buffer Processor to re-assemble fragmented BLE packets[cite: 1]
+  // FIFO Buffer Processor to re-assemble fragmented BLE packets
   function processIncomingBytes(chunk) {
     rxBuffer = Buffer.concat([rxBuffer, chunk]);
 
     while (rxBuffer.length >= 6) {
-      // Find sync headers: 0xB5 0x62[cite: 1]
-      if (rxBuffer[0] !== 0xB5 || rxBuffer[1] !== 0xB62) {
-        // If out of sync, advance 1 byte and try again[cite: 1]
+      // Find sync headers: 0xB5 0x62
+      if (rxBuffer[0] !== 0xB5 || rxBuffer[1] !== 0x62) {
         rxBuffer = rxBuffer.slice(1);
         continue;
       }
 
-      const msgClass = rxBuffer.readUInt8(2);[cite: 1]
-      const msgId = rxBuffer.readUInt8(3);[cite: 1]
-      const payloadLength = rxBuffer.readUInt16LE(4); // Length field[cite: 1]
-      const totalPacketLength = 6 + payloadLength + 2; // Header(6) + Payload(N) + Checksum(2)[cite: 1]
+      const msgClass = rxBuffer.readUInt8(2);
+      const msgId = rxBuffer.readUInt8(3);
+      const payloadLength = rxBuffer.readUInt16LE(4); 
+      const totalPacketLength = 6 + payloadLength + 2; 
 
       if (rxBuffer.length < totalPacketLength) {
-        // Wait for more data to arrive in the stream[cite: 1]
         break;
       }
 
-      // Extract full packet frame
       const packet = rxBuffer.slice(0, totalPacketLength);
-      const payload = packet.slice(6, 6 + payloadLength);[cite: 1]
+      const payload = packet.slice(6, 6 + payloadLength);
 
-      // Verify checksum integrity[cite: 1]
       if (verifyChecksum(packet.slice(2, totalPacketLength - 2), packet.slice(totalPacketLength - 2))) {
-        if (msgClass === 0xFF && msgId === 0x01) { // Telemetry Data Message[cite: 1]
+        if (msgClass === 0xFF && msgId === 0x01) { 
           parseRaceBoxData(payload);
         }
       }
 
-      // Chop processed packet out of the buffer stream
       rxBuffer = rxBuffer.slice(totalPacketLength);
     }
   }
@@ -132,32 +125,26 @@ module.exports = function (app) {
     return ckA === checksumBytes[0] && ckB === checksumBytes[1];
   }
 
-  // Parse fields out of the 80-byte data payload[cite: 1]
-  // Note: Adjust specific byte offsets below if using a customized hardware revision mapping.
+  // Parse fields out of the 80-byte data payload
   function parseRaceBoxData(payload) {
-    if (payload.length < 80) return;[cite: 1]
+    if (payload.length < 80) return;
 
-    // 1. Verify GNSS Fix status[cite: 1]
-    const fixStatus = payload.readUInt8(14); // Example offset for Fix Status[cite: 1]
-    if (fixStatus < 2) return; // Ignore if there's no valid 2D/3D fix[cite: 1]
+    const fixStatus = payload.readUInt8(14); 
+    if (fixStatus < 2) return; 
 
-    // 2. Extract Coordinates (Scaled by 10^7)[cite: 1]
-    const lat = payload.readInt32LE(16) / 10000000;[cite: 1]
-    const lon = payload.readInt32LE(20) / 10000000;[cite: 1]
+    const lat = payload.readInt32LE(16) / 10000000;
+    const lon = payload.readInt32LE(20) / 10000000;
 
-    // 3. Extract Speed & Heading[cite: 1]
-    const speedMms = payload.readUInt32LE(28); // mm/s[cite: 1]
-    const speedMs = speedMms / 1000;          // Convert mm/s to Signal K standard (m/s)
+    const speedMms = payload.readUInt32LE(28); 
+    const speedMs = speedMms / 1000;          
     
-    const headingDegreesScaled = payload.readInt32LE(32); // Scaled by 10^5[cite: 1]
-    const headingRad = (headingDegreesScaled / 100000) * (Math.PI / 180); // Convert to Radians
+    const headingDegreesScaled = payload.readInt32LE(32); 
+    const headingRad = (headingDegreesScaled / 100000) * (Math.PI / 180); 
 
-    // 4. Extract IMU G-Forces (Scaled milli-g)[cite: 1]
-    const gForceX = payload.readInt16LE(40) / 1000; // Front/Back[cite: 1]
-    const gForceY = payload.readInt16LE(42) / 1000; // Right/Left[cite: 1]
-    const gForceZ = payload.readInt16LE(44) / 1000; // Up/Down[cite: 1]
+    const gForceX = payload.readInt16LE(40) / 1000; 
+    const gForceY = payload.readInt16LE(42) / 1000; 
+    const gForceZ = payload.readInt16LE(44) / 1000; 
 
-    // Construct Signal K Delta Format
     const delta = {
       updates: [
         {
@@ -168,7 +155,6 @@ module.exports = function (app) {
             { path: 'navigation.speedOverGround', value: speedMs },
             { path: 'navigation.courseOverGroundTrue', value: headingRad },
             { path: 'navigation.gnss.type', value: 'GPS+GLONASS+GALILEO' },
-            // Storing raw metrics dynamically under a custom key or standard keys if available
             { path: 'navigation.accel.x', value: gForceX },
             { path: 'navigation.accel.y', value: gForceY },
             { path: 'navigation.accel.z', value: gForceZ }
@@ -177,7 +163,6 @@ module.exports = function (app) {
       ]
     };
 
-    // Emit live updates to Signal K Server pipeline
     app.handleMessage(plugin.id, delta);
   }
 
