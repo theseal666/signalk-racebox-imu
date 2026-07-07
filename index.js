@@ -28,6 +28,11 @@ module.exports = function (app) {
   let scanTimeoutId = null;
   let connectTimeoutId = null;
   let debug = false;
+  // Generation counter: bumped on every new connection attempt and every
+  // cleanup. BLE callbacks from an abandoned attempt compare their captured
+  // value against this and tear themselves down instead of continuing,
+  // preventing a stale connect from hijacking the state machine.
+  let connectionAttempt = 0;
 
   // Dynamic config options inside the Signal K Admin UI
   plugin.schema = {
@@ -143,7 +148,8 @@ module.exports = function (app) {
               noble.stopScanning();
               scanTimeoutId = null;
               // Restart scan after a brief pause
-              setTimeout(() => {
+              scanTimeoutId = setTimeout(() => {
+                scanTimeoutId = null;
                 if (!connectedPeripheral && !isConnecting) {
                   app.setProviderStatus('Scan timeout. Restarting scan...');
                   if (debug) app.debug('[RaceBox] Restarting scan');
@@ -196,7 +202,8 @@ module.exports = function (app) {
           if (debug) app.debug('[RaceBox] Initial scan timeout');
           noble.stopScanning();
           scanTimeoutId = null;
-          setTimeout(() => {
+          scanTimeoutId = setTimeout(() => {
+            scanTimeoutId = null;
             if (!connectedPeripheral && !isConnecting) {
               setImmediate(() => noble.startScanning([], false));
             }
@@ -212,6 +219,7 @@ module.exports = function (app) {
     app.setProviderStatus('Stopped');
     if (debug) app.debug('[RaceBox] ========== PLUGIN STOP ==========');
     
+    connectionAttempt++; // invalidate any in-flight BLE callbacks
     if (scanTimeoutId) clearTimeout(scanTimeoutId);
     if (connectTimeoutId) clearTimeout(connectTimeoutId);
     
@@ -226,18 +234,31 @@ module.exports = function (app) {
   };
 
   function connectToDevice(peripheral) {
+    const attempt = ++connectionAttempt;
+    const isStale = () => attempt !== connectionAttempt;
+    // A stale callback means this attempt was abandoned (timeout/cleanup).
+    // The BLE link may still have come up afterwards - force it down so the
+    // device resumes advertising and can be found by the active scan.
+    const abortStale = (where) => {
+      if (debug) app.debug(`[RaceBox] Ignoring stale ${where} callback (attempt ${attempt}) - forcing disconnect`);
+      try { peripheral.disconnect(); } catch (e) {}
+    };
+
     connectedPeripheral = peripheral;
-    if (debug) app.debug('[RaceBox] connectToDevice() called');
+    if (debug) app.debug('[RaceBox] connectToDevice() called, attempt', attempt);
 
     // Set connection timeout
     if (connectTimeoutId) clearTimeout(connectTimeoutId);
     connectTimeoutId = setTimeout(() => {
+      if (isStale()) return;
       app.setProviderStatus('Connection timeout. Retrying...');
       if (debug) app.debug('[RaceBox] Connection timeout');
       cleanupAndRestartScan();
     }, CONNECT_TIMEOUT);
 
     peripheral.connect((err) => {
+      if (isStale()) return abortStale('connect');
+
       if (connectTimeoutId) clearTimeout(connectTimeoutId);
       connectTimeoutId = null;
 
@@ -253,6 +274,7 @@ module.exports = function (app) {
 
       // Set timeout for service discovery
       let servicesTimeoutId = setTimeout(() => {
+        if (isStale()) return;
         app.setProviderStatus('Service discovery timeout. Retrying...');
         if (debug) app.debug('[RaceBox] Service discovery timeout');
         cleanupAndRestartScan();
@@ -261,6 +283,7 @@ module.exports = function (app) {
       // Explicitly find ONLY the exact RaceBox Service UUID
       peripheral.discoverServices([SERVICE_UUID], (sErr, services) => {
         if (servicesTimeoutId) clearTimeout(servicesTimeoutId);
+        if (isStale()) return abortStale('discoverServices');
 
         if (debug) app.debug('[RaceBox] discoverServices callback, sErr:', sErr, 'services:', services ? services.length : 'null');
 
@@ -277,6 +300,7 @@ module.exports = function (app) {
         
         // Set timeout for characteristic discovery
         let charsTimeoutId = setTimeout(() => {
+          if (isStale()) return;
           app.setProviderStatus('Characteristic discovery timeout. Retrying...');
           if (debug) app.debug('[RaceBox] Characteristic discovery timeout');
           cleanupAndRestartScan();
@@ -284,6 +308,7 @@ module.exports = function (app) {
 
         service.discoverCharacteristics([TX_UUID, RX_UUID], (cErr, characteristics) => {
           if (charsTimeoutId) clearTimeout(charsTimeoutId);
+          if (isStale()) return abortStale('discoverCharacteristics');
           isConnecting = false;
 
           if (debug) app.debug('[RaceBox] discoverCharacteristics callback, cErr:', cErr, 'characteristics:', characteristics ? characteristics.length : 'null');
@@ -320,6 +345,7 @@ module.exports = function (app) {
           // timeout only fails the connection if no data has arrived either -
           // the first received data packet also counts as success.
           let subTimeoutId = setTimeout(() => {
+            if (isStale()) return;
             subTimeoutId = null;
             app.setProviderStatus('Subscription timeout. Retrying...');
             if (debug) app.debug('[RaceBox] Subscription timeout - no callback and no data received');
@@ -333,7 +359,20 @@ module.exports = function (app) {
             }
           };
 
+          // Make sure nothing restarted the scanner while we were connecting -
+          // scanning during an active connection destabilizes BlueZ
+          const markStreaming = () => {
+            clearSubTimeout();
+            if (scanTimeoutId) {
+              clearTimeout(scanTimeoutId);
+              scanTimeoutId = null;
+            }
+            noble.stopScanning();
+            app.setProviderStatus('Streaming live data successfully into Signal K.');
+          };
+
           txChar.subscribe((subErr) => {
+            if (isStale()) return abortStale('subscribe');
             if (debug) app.debug('[RaceBox] subscribe callback, subErr:', subErr);
 
             if (subErr) {
@@ -342,18 +381,17 @@ module.exports = function (app) {
               if (debug) app.debug('[RaceBox] Subscribe error:', subErr.message);
               cleanupAndRestartScan();
             } else {
-              clearSubTimeout();
-              app.setProviderStatus('Streaming live data successfully into Signal K.');
+              markStreaming();
               if (debug) app.debug('[RaceBox] Successfully subscribed to TX characteristic - waiting for data...');
             }
           });
 
           txChar.on('data', (rawBytes) => {
+            if (isStale()) return;
             if (subTimeoutId) {
               // Data is flowing even though the subscribe callback hasn't
               // fired - treat the subscription as successful
-              clearSubTimeout();
-              app.setProviderStatus('Streaming live data successfully into Signal K.');
+              markStreaming();
               if (debug) app.debug('[RaceBox] Data flowing without subscribe callback - treating as subscribed');
             }
             if (debug && dataPacketCount === 0) app.debug('[RaceBox] First data packet received, length:', rawBytes.length);
@@ -367,6 +405,7 @@ module.exports = function (app) {
     // peripheral object don't accumulate duplicate disconnect handlers
     peripheral.removeAllListeners('disconnect');
     peripheral.once('disconnect', () => {
+      if (isStale()) return; // newer attempt already handling recovery
       app.setProviderStatus('Device link severed. Searching for hardware...');
       if (debug) app.debug('[RaceBox] Device disconnected unexpectedly');
       cleanupAndRestartScan();
@@ -374,6 +413,8 @@ module.exports = function (app) {
   }
 
   function cleanupAndRestartScan() {
+    // Invalidate all in-flight callbacks/timeouts from the current attempt
+    connectionAttempt++;
     if (debug) app.debug('[RaceBox] cleanupAndRestartScan() called');
     
     if (connectedPeripheral) {
@@ -394,7 +435,8 @@ module.exports = function (app) {
           if (debug) app.debug('[RaceBox] Recovery scan timeout');
           noble.stopScanning();
           scanTimeoutId = null;
-          setTimeout(() => {
+          scanTimeoutId = setTimeout(() => {
+            scanTimeoutId = null;
             if (!connectedPeripheral && !isConnecting) {
               setImmediate(() => noble.startScanning([], false));
             }
