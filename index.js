@@ -253,6 +253,12 @@ module.exports = function (app) {
       if (isStale()) return;
       app.setProviderStatus('Connection timeout. Retrying...');
       if (debug) app.debug('[RaceBox] Connection timeout');
+      // A never-established connection cannot be disconnect()ed - the
+      // controller keeps the pending create-connection alive and it wedges
+      // all subsequent attempts. Cancel it at the HCI level instead.
+      if (typeof peripheral.cancelConnect === 'function') {
+        try { peripheral.cancelConnect(); } catch (e) {}
+      }
       cleanupAndRestartScan();
     }, CONNECT_TIMEOUT);
 
@@ -418,7 +424,13 @@ module.exports = function (app) {
     if (debug) app.debug('[RaceBox] cleanupAndRestartScan() called');
     
     if (connectedPeripheral) {
-      try { connectedPeripheral.disconnect(); } catch(e) {}
+      try {
+        // Cancel a still-pending connection attempt properly, then disconnect
+        if (connectedPeripheral.state === 'connecting' && typeof connectedPeripheral.cancelConnect === 'function') {
+          connectedPeripheral.cancelConnect();
+        }
+        connectedPeripheral.disconnect();
+      } catch(e) {}
     }
     connectedPeripheral = null;
     isConnecting = false;
