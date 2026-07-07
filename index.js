@@ -5,200 +5,171 @@ module.exports = function (app) {
   const plugin = {};
   plugin.id = 'racebox-signalk-plugin';
   plugin.name = 'RaceBox BLE Telemetry';
-  plugin.description = 'Streams high-frequency GNSS and IMU data from RaceBox Mini/S/Micro into Signal K';
+  plugin.description = 'Streams 25Hz GNSS and 6-Axis IMU data from RaceBox Mini/Micro directly into Signal K';
 
-  const RACEBOX_SERVICE_UUID = '6e400001b5a3f393e0a9e50e24dcca9e'; 
-  const RACEBOX_TX_UUID = '6e400003b5a3f393e0a9e50e24dcca9e';      
+  // Strict Nordic UART Service mappings used by RaceBox
+  const SERVICE_UUID = '6e400001b5a3f393e0a9e50e24dcca9e'; 
+  const TX_UUID      = '6e400003b5a3f393e0a9e50e24dcca9e';      
   
   let rxBuffer = Buffer.alloc(0);
-  let connectedDevice = null;
-  let isConnecting = false; // Core lock to prevent connection overlapping loops
-  let messageCount = 0;
-  let statusInterval = null;
+  let connectedPeripheral = null;
+  let isConnecting = false;
+  let calibrationRequested = false;
   let activeOptions = {};
-  let performCalibrationNextPacket = false;
 
-  // --- 1. Interactive Configuration Schema ---
+  // Dynamic config options inside the Signal K Admin UI
   plugin.schema = {
     type: 'object',
     properties: {
-      enableIMU: {
+      zeroImuNow: {
         type: 'boolean',
-        title: 'Enable IMU Streaming (Pitch, Roll, Rate of Turn)',
-        default: true
-      },
-      triggerCalibration: {
-        type: 'boolean',
-        title: '👉 CALIBRATE IMU NOW (Check this box and click Save while the boat is floating naturally at rest to zero out Pitch, Roll, and Yaw-rate offsets)',
+        title: '👉 CALIBRATE IMU: Check this box and click Save while the boat is level and floating naturally to zero out Pitch & Roll offsets.',
         default: false
       },
-      triggerBleReset: {
+      rebootBluetoothStack: {
         type: 'boolean',
-        title: '🔄 FORCE BLUETOOTH RESET (Check this box and click Save to hard-reboot the system Bluetooth stack and force a fresh device scan)',
+        title: '🔄 RESET BLUETOOTH: Check this box and click Save to force-cycle the system Bluetooth radio and clear connection lockups.',
         default: false
       },
-      calibrationOffsets: {
+      offsets: {
         type: 'object',
-        title: 'Current Saved Calibration Offsets',
+        title: 'Saved Calibration Pitch/Roll Offsets (radians)',
         properties: {
           pitch: { type: 'number', default: 0 },
-          roll: { type: 'number', default: 0 },
-          yawRate: { type: 'number', default: 0 }
+          roll: { type: 'number', default: 0 }
         }
       }
     }
   };
 
-  // --- 2. Plugin Lifecycle Management ---
-  plugin.start = function (options, restartPlugin) {
-    app.debug('RaceBox plugin starting...');
-    activeOptions = options || { enableIMU: true, calibrationOffsets: { pitch: 0, roll: 0, yawRate: 0 } };
+  plugin.start = function (options) {
+    activeOptions = options || { offsets: { pitch: 0, roll: 0 } };
 
-    if (activeOptions.triggerBleReset) {
-      app.setProviderStatus('Executing hard Bluetooth interface cycle...');
-      activeOptions.triggerBleReset = false;
+    // Action 1: Hard Reset Linux Bluetooth Stack
+    if (activeOptions.rebootBluetoothStack) {
+      app.setProviderStatus('Executing hardware hcitool/hciconfig reset...');
+      activeOptions.rebootBluetoothStack = false;
       app.savePluginOptions(activeOptions, () => {});
-      
-      exec('sudo hciconfig hci0 down && sudo hciconfig hci0 up', (err) => {
-        if (err) app.error(`Bluetooth hard reset failed: ${err.message}`);
-        setTimeout(() => { restartPlugin(activeOptions); }, 2000);
-      });
-      return; 
+      exec('sudo hciconfig hci0 down && sudo hciconfig hci0 up', () => {});
+      return;
     }
 
-    if (activeOptions.triggerCalibration) {
-      performCalibrationNextPacket = true;
-      app.setProviderStatus('Awaiting next telemetry frame to calibrate...');
+    // Action 2: Arm Calibration Flag
+    if (activeOptions.zeroImuNow) {
+      calibrationRequested = true;
+      app.setProviderStatus('Armed for calibration! Awaiting next clean data packet...');
     } else {
-      app.setProviderStatus('Initializing Bluetooth discovery...');
+      app.setProviderStatus('Initializing Bluetooth subsystem...');
     }
 
+    // Clean old listeners to prevent memory leaking duplication
     noble.removeAllListeners('stateChange');
     noble.removeAllListeners('discover');
 
-    noble.on('stateChange', handleBluetoothState);
-    noble.on('discover', handleDiscovery);
-
-    handleBluetoothState(noble.state);
-
-    statusInterval = setInterval(() => {
-      if (connectedDevice && messageCount > 0) {
-        app.setProviderStatus(`Connected to ${connectedDevice.advertisement.localName} (Streaming data)`);
-        messageCount = 0;
+    noble.on('stateChange', (state) => {
+      if (state === 'poweredOn') {
+        if (!connectedPeripheral && !isConnecting) {
+          app.setProviderStatus('Scanning for RaceBox hardware...');
+          noble.startScanning([], false);
+        }
+      } else {
+        app.setProviderStatus(`Bluetooth radio state: ${state}`);
+        noble.stopScanning();
       }
-    }, 5000);
+    });
+
+    noble.on('discover', (peripheral) => {
+      if (isConnecting || connectedPeripheral) return;
+
+      const localName = peripheral.advertisement.localName;
+      if (localName && localName.startsWith('RaceBox')) {
+        isConnecting = true;
+        app.setProviderStatus(`Found ${localName}! Opening connection channel...`);
+        noble.stopScanning();
+
+        // 500ms delay protects against BlueZ concurrent socket request crashes
+        setTimeout(() => connectToDevice(peripheral), 500);
+      }
+    });
+
+    // Fire initial state check manually
+    if (noble.state === 'poweredOn') {
+      app.setProviderStatus('Scanning for RaceBox hardware...');
+      noble.startScanning([], false);
+    }
   };
 
   plugin.stop = function () {
-    app.debug('RaceBox plugin stopping...');
-    if (statusInterval) clearInterval(statusInterval);
-    
+    app.setProviderStatus('Stopped');
     noble.removeAllListeners('stateChange');
     noble.removeAllListeners('discover');
-    
-    if (connectedDevice) {
-      try {
-        connectedDevice.disconnect();
-      } catch (e) {
-        app.debug(`Disconnect error: ${e.message}`);
-      }
-    }
     noble.stopScanning();
-    connectedDevice = null;
+    if (connectedPeripheral) {
+      try { connectedPeripheral.disconnect(); } catch (e) {}
+    }
+    connectedPeripheral = null;
     isConnecting = false;
-    app.setProviderStatus('Stopped');
   };
 
-  // --- 3. BLE Connectivity ---
-  function handleBluetoothState(state) {
-    if (state === 'poweredOn') {
-      if (!connectedDevice && !isConnecting) {
-        app.setProviderStatus('Scanning for RaceBox hardware...');
-        noble.startScanning([], false); 
-      }
-    } else {
-      app.setProviderStatus(`Bluetooth unavailable: ${state}`);
-      noble.stopScanning();
-    }
-  }
-
-  function handleDiscovery(peripheral) {
-    // If we are already handling a connection attempt, kill duplicate triggers immediately
-    if (isConnecting || connectedDevice) return;
-
-    const name = peripheral.advertisement.localName;
-    if (name && name.startsWith('RaceBox')) {
-      isConnecting = true; 
-      app.setProviderStatus(`Found ${name}! Halting active scan slots...`);
-      noble.stopScanning();
-      
-      // Let BlueZ completely clear out the scanning sockets before spinning up connection lines
-      setTimeout(() => {
-        app.setProviderStatus(`Connecting directly to ${name}...`);
-        connectToDevice(peripheral);
-      }, 500);
-    }
-  }
-
   function connectToDevice(peripheral) {
-    connectedDevice = peripheral;
-    
-    peripheral.connect((error) => {
-      if (error) {
-        app.setProviderStatus(`Connection failed: ${error.message}`);
-        retryScanning();
+    connectedPeripheral = peripheral;
+
+    peripheral.connect((err) => {
+      if (err) {
+        app.setProviderStatus(`Link failed: ${err.message}. Retrying...`);
+        cleanupAndRestartScan();
         return;
       }
-      
-      app.setProviderStatus(`Connected to ${peripheral.advertisement.localName}. Waiting for GATT sync...`);
-      
-      setTimeout(() => {
-        app.setProviderStatus('Querying all data streams from device...');
-        
-        peripheral.discoverAllServicesAndCharacteristics((err, services, characteristics) => {
-          // Clear connection lock since discovery successfully wrapped up
+
+      app.setProviderStatus('Connected. Syncing targeted GATT profile...');
+
+      // Fixes the freeze: explicitly find ONLY the exact RaceBox Service UUID
+      peripheral.discoverServices([SERVICE_UUID], (sErr, services) => {
+        if (sErr || !services || services.length === 0) {
+          app.setProviderStatus('Error: Targeted RaceBox service structure not exposed.');
+          cleanupAndRestartScan();
+          return;
+        }
+
+        // Explicitly find ONLY the exact RaceBox TX Characteristic UUID
+        services[0].discoverCharacteristics([TX_UUID], (cErr, characteristics) => {
           isConnecting = false; 
 
-          if (err) {
-            app.setProviderStatus(`Service discovery error: ${err.message}`);
-            retryScanning();
+          const txChar = characteristics ? characteristics.find(c => c.uuid === TX_UUID) : null;
+          if (cErr || !txChar) {
+            app.setProviderStatus('Error: Core telemetry stream characteristic not found.');
+            cleanupAndRestartScan();
             return;
           }
-          
-          const txChar = characteristics.find(c => c.uuid.toLowerCase() === RACEBOX_TX_UUID);
-          
-          if (txChar) {
-            txChar.subscribe((subErr) => {
-              if (subErr) {
-                app.setProviderStatus(`Subscription error: ${subErr.message}`);
-                retryScanning();
-              } else {
-                app.setProviderStatus('Streaming live data successfully.');
-              }
-            });
-            
-            txChar.on('data', (data) => {
-              processIncomingBytes(data);
-            });
-          } else {
-            app.setProviderStatus('Error: Core telemetry stream UUID not found.');
-            retryScanning();
-          }
+
+          app.setProviderStatus('Subscribing to 25Hz telemetry stream...');
+          txChar.subscribe((subErr) => {
+            if (subErr) {
+              app.setProviderStatus(`Subscription denied: ${subErr.message}`);
+              cleanupAndRestartScan();
+            } else {
+              app.setProviderStatus('Streaming live data successfully into Signal K.');
+            }
+          });
+
+          txChar.on('data', (rawBytes) => {
+            processIncomingBytes(rawBytes);
+          });
         });
-      }, 1000);
+      });
     });
 
     peripheral.on('disconnect', () => {
-      app.setProviderStatus('Device link lost. Re-scanning...');
-      retryScanning();
+      app.setProviderStatus('Device link severed. Searching for hardware...');
+      cleanupAndRestartScan();
     });
   }
 
-  function retryScanning() {
-    if (connectedDevice) {
-      try { connectedDevice.disconnect(); } catch(e) {}
+  function cleanupAndRestartScan() {
+    if (connectedPeripheral) {
+      try { connectedPeripheral.disconnect(); } catch(e) {}
     }
-    connectedDevice = null;
+    connectedPeripheral = null;
     isConnecting = false;
     rxBuffer = Buffer.alloc(0);
     if (noble.state === 'poweredOn') {
@@ -206,7 +177,7 @@ module.exports = function (app) {
     }
   }
 
-  // --- 4. Byte Stream Reassembly & Parsers ---
+  // --- Stream Buffer Re-assembly Pipeline ---
   function processIncomingBytes(chunk) {
     rxBuffer = Buffer.concat([rxBuffer, chunk]);
 
@@ -218,8 +189,8 @@ module.exports = function (app) {
 
       const msgClass = rxBuffer.readUInt8(2);
       const msgId = rxBuffer.readUInt8(3);
-      const payloadLength = rxBuffer.readUInt16LE(4); 
-      const totalPacketLength = 6 + payloadLength + 2; 
+      const payloadLength = rxBuffer.readUInt16LE(4);
+      const totalPacketLength = 6 + payloadLength + 2;
 
       if (rxBuffer.length < totalPacketLength) {
         break; 
@@ -228,9 +199,15 @@ module.exports = function (app) {
       const packet = rxBuffer.slice(0, totalPacketLength);
       const payload = packet.slice(6, 6 + payloadLength);
 
-      if (verifyChecksum(packet.slice(2, totalPacketLength - 2), packet.slice(totalPacketLength - 2))) {
-        if (msgClass === 0xFF && msgId === 0x01) { 
-          messageCount++;
+      // Verify checksum integrity
+      let ckA = 0, ckB = 0;
+      for (let i = 2; i < totalPacketLength - 2; i++) {
+        ckA = (ckA + packet[i]) & 0xFF;
+        ckB = (ckB + ckA) & 0xFF;
+      }
+
+      if (ckA === packet[totalPacketLength - 2] && ckB === packet[totalPacketLength - 1]) {
+        if (msgClass === 0xFF && msgId === 0x01) {
           parseRaceBoxData(payload);
         }
       }
@@ -239,57 +216,70 @@ module.exports = function (app) {
     }
   }
 
-  function verifyChecksum(dataBytes, checksumBytes) {
-    let ckA = 0, ckB = 0;
-    for (let i = 0; i < dataBytes.length; i++) {
-      ckA = (ckA + dataBytes[i]) & 0xFF;
-      ckB = (ckB + ckA) & 0xFF;
-    }
-    return ckA === checksumBytes[0] && ckB === checksumBytes[1];
-  }
-
+  // --- Core Binary Packet Parser ---
   function parseRaceBoxData(payload) {
     if (payload.length < 80) return;
 
     const values = [];
 
-    if (activeOptions.enableIMU) {
-      const gX = payload.readInt16LE(40) / 1000; 
-      const gY = payload.readInt16LE(42) / 1000; 
-      const gZ = payload.readInt16LE(44) / 1000; 
+    // 1. Raw 6-Axis IMU Sensor Channels
+    const accelX = payload.readInt16LE(40) / 1000; // Front/Back (g)
+    const accelY = payload.readInt16LE(42) / 1000; // Side/Side (g)
+    const accelZ = payload.readInt16LE(44) / 1000; // Vertical (g)
 
-      const rotZ = (payload.readInt16LE(50) / 100) * (Math.PI / 180); 
+    const gyroX = (payload.readInt16LE(46) / 100) * (Math.PI / 180); // Roll rate (rad/s)
+    const gyroY = (payload.readInt16LE(48) / 100) * (Math.PI / 180); // Pitch rate (rad/s)
+    const gyroZ = (payload.readInt16LE(50) / 100) * (Math.PI / 180); // Yaw rate/Rate of Turn (rad/s)
 
-      const rawRoll = Math.atan2(gY, gZ);
-      const rawPitch = Math.atan2(-gX, Math.sqrt(gY * gY + gZ * gZ));
-      const rawYawRate = rotZ; 
+    // Calculate immediate derived Pitch/Roll orientation angles
+    const calculatedRoll = Math.atan2(accelY, accelZ);
+    const calculatedPitch = Math.atan2(-accelX, Math.sqrt(accelY * accelY + accelZ * accelZ));
 
-      if (performCalibrationNextPacket) {
-        performCalibrationNextPacket = false;
-        activeOptions.triggerCalibration = false;
-        activeOptions.calibrationOffsets = { pitch: rawPitch, roll: rawRoll, yawRate: rawYawRate };
-        
-        app.savePluginOptions(activeOptions, () => {
-          app.debug('Static natural floating calibration offsets saved.');
-        });
-      }
-
-      const offsets = activeOptions.calibrationOffsets || { pitch: 0, roll: 0, yawRate: 0 };
-      const calibratedRoll = rawRoll - (offsets.roll || 0);
-      const calibratedPitch = rawPitch - (offsets.pitch || 0);
-      const calibratedYawRate = rawYawRate - (offsets.yawRate || 0);
-
-      values.push(
-        { path: 'navigation.attitude.roll', value: calibratedRoll },
-        { path: 'navigation.attitude.pitch', value: calibratedPitch },
-        { path: 'navigation.rateOfTurn', value: calibratedYawRate },
-        { path: 'navigation.accel.x', value: gX },
-        { path: 'navigation.accel.y', value: gY },
-        { path: 'navigation.accel.z', value: gZ }
-      );
+    // Live execution of boat level calibration request
+    if (calibrationRequested) {
+      calibrationRequested = false;
+      activeOptions.zeroImuNow = false;
+      activeOptions.offsets = { pitch: calculatedPitch, roll: calculatedRoll };
+      app.savePluginOptions(activeOptions, () => {
+        app.debug('Boat alignment calibration successful.');
+      });
     }
 
+    // Apply baseline alignment offsets
+    const currentOffsets = activeOptions.offsets || { pitch: 0, roll: 0 };
+    const finalRoll = calculatedRoll - currentOffsets.roll;
+    const finalPitch = calculatedPitch - currentOffsets.pitch;
+
+    // Push 6 IMU metrics and calculated values to standard paths
+    values.push(
+      { path: 'navigation.attitude.roll', value: finalRoll },
+      { path: 'navigation.attitude.pitch', value: finalPitch },
+      { path: 'navigation.rateOfTurn', value: gyroZ }, // Gyro Z is standard ROT
+      { path: 'navigation.accel.x', value: accelX },
+      { path: 'navigation.accel.y', value: accelY },
+      { path: 'navigation.accel.z', value: accelZ },
+      { path: 'navigation.gyro.x', value: gyroX },
+      { path: 'navigation.gyro.y', value: gyroY }
+    );
+
+    // 2. Read System State Metrics
+    const batteryPercent = payload.readUInt8(52); // Battery level %
+    values.push({ 
+      path: 'electrical.batteries.racebox.capacity.stateOfCharge', 
+      value: batteryPercent / 100 
+    });
+
+    // 3. High-Performance GNSS Engine Extraction
     const fixStatus = payload.readUInt8(14); 
+    const satellitesConnected = payload.readUInt8(15);
+    const positionAccuracyMm = payload.readUInt32LE(36); // Horizontal Accuracy (mm)
+
+    values.push(
+      { path: 'navigation.gnss.satellites', value: satellitesConnected },
+      { path: 'navigation.gnss.horizontalDilution', value: positionAccuracyMm / 1000 } // Expose in meters
+    );
+
+    // Only broadcast tracking and position vectors if a live 2D/3D fix exists
     if (fixStatus >= 2) { 
       const lat = payload.readInt32LE(16) / 10000000;
       const lon = payload.readInt32LE(20) / 10000000;
@@ -308,17 +298,16 @@ module.exports = function (app) {
       );
     }
 
-    if (values.length > 0) {
-      app.handleMessage(plugin.id, {
-        updates: [
-          {
-            source: { label: plugin.id },
-            timestamp: new Date().toISOString(),
-            values: values
-          }
-        ]
-      });
-    }
+    // Deliver unified update packet right to the Signal K Data Browser
+    app.handleMessage(plugin.id, {
+      updates: [
+        {
+          source: { label: plugin.id },
+          timestamp: new Date().toISOString(),
+          values: values
+        }
+      ]
+    });
   }
 
   return plugin;
