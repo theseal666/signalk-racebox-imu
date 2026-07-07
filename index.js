@@ -1,4 +1,4 @@
-const noble = require('@abandonware/noble');
+const { createBluetooth } = require('node-ble');
 const { exec } = require('child_process');
 
 module.exports = function (app) {
@@ -8,31 +8,33 @@ module.exports = function (app) {
   plugin.description = 'Streams 25Hz GNSS and 6-Axis IMU data from RaceBox Mini/Micro directly into Signal K';
 
   // Nordic UART Service mappings (RaceBox uses this standard)
-  const SERVICE_UUID = '6e400001b5a3f393e0a9e50e24dcca9e'; 
-  const RX_UUID      = '6e400002b5a3f393e0a9e50e24dcca9e'; // Host → Device (write)
-  const TX_UUID      = '6e400003b5a3f393e0a9e50e24dcca9e'; // Device → Host (notify/read)
-  
-  // Timeouts in ms
-  const CONNECT_TIMEOUT = 10000;
-  const DISCOVER_SERVICES_TIMEOUT = 5000;
-  const DISCOVER_CHARACTERISTICS_TIMEOUT = 5000;
-  const SUBSCRIBE_TIMEOUT = 5000;
-  const SCAN_TIMEOUT = 30000;
-  
+  // node-ble/BlueZ uses dashed lowercase UUID format
+  const SERVICE_UUID = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
+  const TX_UUID      = '6e400003-b5a3-f393-e0a9-e50e24dcca9e'; // Device → Host (notify)
+
+  // Timing configuration (ms)
+  const ADAPTER_TIMEOUT = 10000;      // waiting for the BlueZ adapter
+  const SCAN_POLL_INTERVAL = 2000;    // how often to check discovered devices
+  const CONNECT_TIMEOUT = 15000;      // GATT connection establishment
+  const GATT_TIMEOUT = 10000;         // service/characteristic discovery
+  const RETRY_DELAY = 5000;           // pause between failed sessions
+  const WATCHDOG_INTERVAL = 5000;     // connection/data health check period
+  const DATA_STALE_TIMEOUT = 15000;   // no data for this long => reconnect
+
   let rxBuffer = Buffer.alloc(0);
-  let connectedPeripheral = null;
-  let isConnecting = false;
   let calibrationRequested = false;
   let activeOptions = {};
   let dataPacketCount = 0;
-  let scanTimeoutId = null;
-  let connectTimeoutId = null;
   let debug = false;
-  // Generation counter: bumped on every new connection attempt and every
-  // cleanup. BLE callbacks from an abandoned attempt compare their captured
-  // value against this and tear themselves down instead of continuing,
-  // preventing a stale connect from hijacking the state machine.
-  let connectionAttempt = 0;
+
+  // Session lifecycle: the main loop runs one session at a time; the
+  // generation counter invalidates callbacks from finished sessions
+  let running = false;
+  let sessionGeneration = 0;
+  let btContext = null;      // { bluetooth, destroy } from createBluetooth()
+  let currentDevice = null;
+  let currentTxChar = null;
+  let lastDataTime = 0;
 
   // Dynamic config options inside the Signal K Admin UI
   plugin.schema = {
@@ -45,7 +47,7 @@ module.exports = function (app) {
       },
       rebootBluetoothStack: {
         type: 'boolean',
-        title: 'RESET BLUETOOTH - Check this box and click Save to force-cycle the system Bluetooth radio and clear connection lockups.',
+        title: 'RESET BLUETOOTH - Check this box and click Save to restart the system Bluetooth service and clear connection lockups.',
         default: false
       },
       debugLogging: {
@@ -73,33 +75,28 @@ module.exports = function (app) {
       app.debug('[RaceBox] Plugin starting with options:', JSON.stringify(activeOptions));
     }
 
-    // Action 1: Hard Reset Linux Bluetooth Stack
+    // Action 1: Restart the system Bluetooth service (BlueZ)
     if (activeOptions.rebootBluetoothStack) {
-      app.setProviderStatus('RESET: Executing hciconfig reset...');
+      app.setProviderStatus('RESET: Restarting Bluetooth service...');
       if (debug) app.debug('[RaceBox] Bluetooth reset requested');
-      
+
       activeOptions.rebootBluetoothStack = false;
       app.savePluginOptions(activeOptions, (err) => {
-        if (err) {
-          app.error('[RaceBox] Failed to clear reset flag:', err);
-        } else {
-          if (debug) app.debug('[RaceBox] Reset flag cleared in config');
-        }
+        if (err) app.error('[RaceBox] Failed to clear reset flag:', err);
       });
 
-      // Execute reset command with proper error handling
-      exec('sudo hciconfig hci0 down && sudo hciconfig hci0 up', (error, stdout, stderr) => {
+      exec('sudo systemctl restart bluetooth', (error) => {
         if (error) {
           app.error('[RaceBox] Bluetooth reset error:', error.message);
           app.setProviderStatus('RESET FAILED: ' + error.message);
-          if (debug) app.debug('[RaceBox] stderr:', stderr);
         } else {
-          if (debug) app.debug('[RaceBox] Bluetooth reset completed successfully');
-          app.setProviderStatus('RESET: Bluetooth stack cycled. Scanning for RaceBox...');
-          // Restart plugin after reset
-          plugin.stop();
-          plugin.start(activeOptions);
+          if (debug) app.debug('[RaceBox] Bluetooth service restarted');
         }
+        // Continue with normal startup either way, after a settle delay
+        setTimeout(() => {
+          running = true;
+          mainLoop().catch((e) => app.error('[RaceBox] Main loop crashed:', e.message));
+        }, 2000);
       });
       return;
     }
@@ -109,352 +106,162 @@ module.exports = function (app) {
       calibrationRequested = true;
       app.setProviderStatus('CAL: Armed for calibration. Boat must be level and floating naturally.');
       if (debug) app.debug('[RaceBox] Calibration mode armed');
-      
-      // Clear the flag immediately so it doesn't persist after save
+
       activeOptions.zeroImuNow = false;
       dataPacketCount = 0;
-      
+
       app.savePluginOptions(activeOptions, (err) => {
-        if (err) {
-          app.error('[RaceBox] Failed to clear calibration flag:', err);
-        } else {
-          if (debug) app.debug('[RaceBox] Calibration flag cleared in config');
-        }
+        if (err) app.error('[RaceBox] Failed to clear calibration flag:', err);
       });
-    } else {
-      app.setProviderStatus('Initializing Bluetooth subsystem...');
-      if (debug) app.debug('[RaceBox] Normal startup');
     }
 
-    // Clean old listeners to prevent memory leaking duplication
-    noble.removeAllListeners('stateChange');
-    noble.removeAllListeners('discover');
-
-    noble.on('stateChange', (state) => {
-      if (debug) app.debug('[RaceBox] Bluetooth state changed to:', state);
-      
-      if (state === 'poweredOn') {
-        if (!connectedPeripheral && !isConnecting) {
-          app.setProviderStatus('Scanning for RaceBox hardware...');
-          if (debug) app.debug('[RaceBox] Starting scan...');
-          // Defer scanning to next tick to avoid blocking Signal K
-          setImmediate(() => {
-            noble.startScanning([], false);
-            
-            // Set scan timeout to prevent indefinite scanning
-            if (scanTimeoutId) clearTimeout(scanTimeoutId);
-            scanTimeoutId = setTimeout(() => {
-              if (debug) app.debug('[RaceBox] Scan timeout - stopping scan');
-              noble.stopScanning();
-              scanTimeoutId = null;
-              // Restart scan after a brief pause
-              scanTimeoutId = setTimeout(() => {
-                scanTimeoutId = null;
-                if (!connectedPeripheral && !isConnecting) {
-                  app.setProviderStatus('Scan timeout. Restarting scan...');
-                  if (debug) app.debug('[RaceBox] Restarting scan');
-                  setImmediate(() => noble.startScanning([], false));
-                }
-              }, 2000);
-            }, SCAN_TIMEOUT);
-          });
-        }
-      } else {
-        app.setProviderStatus(`Bluetooth radio state: ${state}`);
-        if (scanTimeoutId) clearTimeout(scanTimeoutId);
-        noble.stopScanning();
-      }
-    });
-
-    noble.on('discover', (peripheral) => {
-      if (isConnecting || connectedPeripheral) return;
-
-      const localName = peripheral.advertisement.localName;
-      if (debug) app.debug('[RaceBox] Discovered device:', localName);
-      
-      if (localName && localName.startsWith('RaceBox')) {
-        isConnecting = true;
-        app.setProviderStatus(`Found ${localName}! Opening connection channel...`);
-        if (debug) app.debug(`[RaceBox] Connecting to RaceBox device: ${localName}`);
-        
-        // Clear scan timeout when device found
-        if (scanTimeoutId) clearTimeout(scanTimeoutId);
-        scanTimeoutId = null;
-        
-        noble.stopScanning();
-
-        // 500ms delay protects against BlueZ concurrent socket request crashes
-        setTimeout(() => connectToDevice(peripheral), 500);
-      }
-    });
-
-    // Fire initial state check manually
-    if (noble.state === 'poweredOn') {
-      app.setProviderStatus('Scanning for RaceBox hardware...');
-      if (debug) app.debug('[RaceBox] Bluetooth already powered on, starting initial scan');
-      // Defer to next tick
-      setImmediate(() => {
-        noble.startScanning([], false);
-        
-        // Set initial scan timeout
-        if (scanTimeoutId) clearTimeout(scanTimeoutId);
-        scanTimeoutId = setTimeout(() => {
-          if (debug) app.debug('[RaceBox] Initial scan timeout');
-          noble.stopScanning();
-          scanTimeoutId = null;
-          scanTimeoutId = setTimeout(() => {
-            scanTimeoutId = null;
-            if (!connectedPeripheral && !isConnecting) {
-              setImmediate(() => noble.startScanning([], false));
-            }
-          }, 2000);
-        }, SCAN_TIMEOUT);
-      });
-    } else {
-      if (debug) app.debug('[RaceBox] Bluetooth not yet powered on, state:', noble.state);
-    }
+    running = true;
+    mainLoop().catch((e) => app.error('[RaceBox] Main loop crashed:', e.message));
   };
 
   plugin.stop = function () {
     app.setProviderStatus('Stopped');
     if (debug) app.debug('[RaceBox] ========== PLUGIN STOP ==========');
-    
-    connectionAttempt++; // invalidate any in-flight BLE callbacks
-    if (scanTimeoutId) clearTimeout(scanTimeoutId);
-    if (connectTimeoutId) clearTimeout(connectTimeoutId);
-    
-    noble.removeAllListeners('stateChange');
-    noble.removeAllListeners('discover');
-    noble.stopScanning();
-    if (connectedPeripheral) {
-      try { connectedPeripheral.disconnect(); } catch (e) {}
-    }
-    connectedPeripheral = null;
-    isConnecting = false;
+    running = false;
+    sessionGeneration++; // invalidate in-flight session callbacks
+    cleanupSession('plugin stop'); // fire-and-forget async teardown
   };
 
-  function connectToDevice(peripheral) {
-    const attempt = ++connectionAttempt;
-    const isStale = () => attempt !== connectionAttempt;
-    // A stale callback means this attempt was abandoned (timeout/cleanup).
-    // The BLE link may still have come up afterwards - force it down so the
-    // device resumes advertising and can be found by the active scan.
-    const abortStale = (where) => {
-      if (debug) app.debug(`[RaceBox] Ignoring stale ${where} callback (attempt ${attempt}) - forcing disconnect`);
-      try { peripheral.disconnect(); } catch (e) {}
-    };
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-    connectedPeripheral = peripheral;
-    if (debug) app.debug('[RaceBox] connectToDevice() called, attempt', attempt);
-
-    // Set connection timeout
-    if (connectTimeoutId) clearTimeout(connectTimeoutId);
-    connectTimeoutId = setTimeout(() => {
-      if (isStale()) return;
-      app.setProviderStatus('Connection timeout. Retrying...');
-      if (debug) app.debug('[RaceBox] Connection timeout');
-      // A never-established connection cannot be disconnect()ed - the
-      // controller keeps the pending create-connection alive and it wedges
-      // all subsequent attempts. Cancel it at the HCI level instead.
-      if (typeof peripheral.cancelConnect === 'function') {
-        try { peripheral.cancelConnect(); } catch (e) {}
-      }
-      cleanupAndRestartScan();
-    }, CONNECT_TIMEOUT);
-
-    peripheral.connect((err) => {
-      if (isStale()) return abortStale('connect');
-
-      if (connectTimeoutId) clearTimeout(connectTimeoutId);
-      connectTimeoutId = null;
-
-      if (err) {
-        app.setProviderStatus(`Link failed: ${err.message}. Retrying...`);
-        if (debug) app.debug('[RaceBox] Connection error:', err.message);
-        cleanupAndRestartScan();
-        return;
-      }
-
-      app.setProviderStatus('Connected. Syncing targeted GATT profile...');
-      if (debug) app.debug('[RaceBox] Connected to RaceBox device, discovering services...');
-
-      // Set timeout for service discovery
-      let servicesTimeoutId = setTimeout(() => {
-        if (isStale()) return;
-        app.setProviderStatus('Service discovery timeout. Retrying...');
-        if (debug) app.debug('[RaceBox] Service discovery timeout');
-        cleanupAndRestartScan();
-      }, DISCOVER_SERVICES_TIMEOUT);
-
-      // Explicitly find ONLY the exact RaceBox Service UUID
-      peripheral.discoverServices([SERVICE_UUID], (sErr, services) => {
-        if (servicesTimeoutId) clearTimeout(servicesTimeoutId);
-        if (isStale()) return abortStale('discoverServices');
-
-        if (debug) app.debug('[RaceBox] discoverServices callback, sErr:', sErr, 'services:', services ? services.length : 'null');
-
-        if (sErr || !services || services.length === 0) {
-          app.setProviderStatus('Error: Targeted RaceBox service structure not exposed.');
-          if (debug) app.debug('[RaceBox] Service discovery error:', sErr);
-          cleanupAndRestartScan();
-          return;
-        }
-
-        // Now discover characteristics on the SERVICE, not the peripheral
-        const service = services[0];
-        if (debug) app.debug('[RaceBox] Found service, discovering characteristics...');
-        
-        // Set timeout for characteristic discovery
-        let charsTimeoutId = setTimeout(() => {
-          if (isStale()) return;
-          app.setProviderStatus('Characteristic discovery timeout. Retrying...');
-          if (debug) app.debug('[RaceBox] Characteristic discovery timeout');
-          cleanupAndRestartScan();
-        }, DISCOVER_CHARACTERISTICS_TIMEOUT);
-
-        service.discoverCharacteristics([TX_UUID, RX_UUID], (cErr, characteristics) => {
-          if (charsTimeoutId) clearTimeout(charsTimeoutId);
-          if (isStale()) return abortStale('discoverCharacteristics');
-          isConnecting = false;
-
-          if (debug) app.debug('[RaceBox] discoverCharacteristics callback, cErr:', cErr, 'characteristics:', characteristics ? characteristics.length : 'null');
-
-          if (cErr || !characteristics) {
-            app.setProviderStatus('Error: Could not discover RaceBox characteristics.');
-            if (debug) app.debug('[RaceBox] Characteristic discovery error:', cErr);
-            cleanupAndRestartScan();
-            return;
-          }
-
-          const txChar = characteristics.find(c => c.uuid === TX_UUID);
-          const rxChar = characteristics.find(c => c.uuid === RX_UUID);
-
-          if (debug) app.debug('[RaceBox] TX characteristic found:', !!txChar, 'RX characteristic found:', !!rxChar);
-
-          if (!txChar) {
-            app.setProviderStatus('Error: TX characteristic (data stream) not found.');
-            if (debug) app.debug('[RaceBox] TX characteristic not found');
-            cleanupAndRestartScan();
-            return;
-          }
-
-          if (!rxChar) {
-            if (debug) app.debug('[RaceBox] Warning: RX characteristic not found.');
-          }
-
-          // Subscribe to TX (device → host data stream)
-          app.setProviderStatus('Subscribing to 25Hz telemetry stream...');
-          if (debug) app.debug('[RaceBox] Subscribing to TX characteristic...');
-          
-          // Set timeout for subscription. On some BlueZ stacks the subscribe
-          // callback never fires even though notifications flow, so the
-          // timeout only fails the connection if no data has arrived either -
-          // the first received data packet also counts as success.
-          let subTimeoutId = setTimeout(() => {
-            if (isStale()) return;
-            subTimeoutId = null;
-            app.setProviderStatus('Subscription timeout. Retrying...');
-            if (debug) app.debug('[RaceBox] Subscription timeout - no callback and no data received');
-            cleanupAndRestartScan();
-          }, SUBSCRIBE_TIMEOUT);
-
-          const clearSubTimeout = () => {
-            if (subTimeoutId) {
-              clearTimeout(subTimeoutId);
-              subTimeoutId = null;
-            }
-          };
-
-          // Make sure nothing restarted the scanner while we were connecting -
-          // scanning during an active connection destabilizes BlueZ
-          const markStreaming = () => {
-            clearSubTimeout();
-            if (scanTimeoutId) {
-              clearTimeout(scanTimeoutId);
-              scanTimeoutId = null;
-            }
-            noble.stopScanning();
-            app.setProviderStatus('Streaming live data successfully into Signal K.');
-          };
-
-          txChar.subscribe((subErr) => {
-            if (isStale()) return abortStale('subscribe');
-            if (debug) app.debug('[RaceBox] subscribe callback, subErr:', subErr);
-
-            if (subErr) {
-              clearSubTimeout();
-              app.setProviderStatus(`Subscription denied: ${subErr.message}`);
-              if (debug) app.debug('[RaceBox] Subscribe error:', subErr.message);
-              cleanupAndRestartScan();
-            } else {
-              markStreaming();
-              if (debug) app.debug('[RaceBox] Successfully subscribed to TX characteristic - waiting for data...');
-            }
-          });
-
-          txChar.on('data', (rawBytes) => {
-            if (isStale()) return;
-            if (subTimeoutId) {
-              // Data is flowing even though the subscribe callback hasn't
-              // fired - treat the subscription as successful
-              markStreaming();
-              if (debug) app.debug('[RaceBox] Data flowing without subscribe callback - treating as subscribed');
-            }
-            if (debug && dataPacketCount === 0) app.debug('[RaceBox] First data packet received, length:', rawBytes.length);
-            processIncomingBytes(rawBytes);
-          });
-        });
-      });
+  function withTimeout(promise, ms, label) {
+    let timer;
+    const timeout = new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
     });
-
-    // Use removeAllListeners + once so repeated connect cycles on the same
-    // peripheral object don't accumulate duplicate disconnect handlers
-    peripheral.removeAllListeners('disconnect');
-    peripheral.once('disconnect', () => {
-      if (isStale()) return; // newer attempt already handling recovery
-      app.setProviderStatus('Device link severed. Searching for hardware...');
-      if (debug) app.debug('[RaceBox] Device disconnected unexpectedly');
-      cleanupAndRestartScan();
-    });
+    return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
   }
 
-  function cleanupAndRestartScan() {
-    // Invalidate all in-flight callbacks/timeouts from the current attempt
-    connectionAttempt++;
-    if (debug) app.debug('[RaceBox] cleanupAndRestartScan() called');
-    
-    if (connectedPeripheral) {
+  // --- Main reconnect loop: one BLE session at a time, retry on failure ---
+  async function mainLoop() {
+    while (running) {
+      const gen = ++sessionGeneration;
       try {
-        // Cancel a still-pending connection attempt properly, then disconnect
-        if (connectedPeripheral.state === 'connecting' && typeof connectedPeripheral.cancelConnect === 'function') {
-          connectedPeripheral.cancelConnect();
-        }
-        connectedPeripheral.disconnect();
-      } catch(e) {}
+        await runSession(gen);
+      } catch (err) {
+        if (!running) break;
+        app.setProviderStatus(`${err.message}. Retrying in ${RETRY_DELAY / 1000}s...`);
+        if (debug) app.debug('[RaceBox] Session ended:', err.message);
+      }
+      await cleanupSession('session end');
+      if (!running) break;
+      await sleep(RETRY_DELAY);
     }
-    connectedPeripheral = null;
-    isConnecting = false;
+  }
+
+  async function runSession(gen) {
+    app.setProviderStatus('Initializing Bluetooth (BlueZ/D-Bus)...');
+    btContext = createBluetooth();
+    const adapter = await withTimeout(btContext.bluetooth.defaultAdapter(), ADAPTER_TIMEOUT, 'Bluetooth adapter init');
+
+    if (!(await adapter.isPowered().catch(() => false))) {
+      throw new Error('Bluetooth adapter is powered off (try: bluetoothctl power on)');
+    }
+
+    // Scan and poll BlueZ's device list for a RaceBox by name
+    app.setProviderStatus('Scanning for RaceBox hardware...');
+    try {
+      if (!(await adapter.isDiscovering())) await adapter.startDiscovery();
+    } catch (e) {
+      if (debug) app.debug('[RaceBox] startDiscovery:', e.message);
+    }
+
+    let device = null;
+    let deviceName = null;
+    while (running && gen === sessionGeneration && !device) {
+      const macs = await adapter.devices();
+      for (const mac of macs) {
+        try {
+          const candidate = await adapter.getDevice(mac);
+          const name = await withTimeout(candidate.getName(), 3000, 'getName').catch(() => null);
+          if (debug && name) app.debug('[RaceBox] Discovered device:', name);
+          if (name && name.startsWith('RaceBox')) {
+            device = candidate;
+            deviceName = name;
+            break;
+          }
+        } catch (e) {
+          // device disappeared from BlueZ cache - ignore
+        }
+      }
+      if (!device) await sleep(SCAN_POLL_INTERVAL);
+    }
+    if (!device) return; // stopped while scanning
+
+    currentDevice = device;
+    app.setProviderStatus(`Found ${deviceName}! Connecting...`);
+    if (debug) app.debug(`[RaceBox] Connecting to: ${deviceName}`);
+
+    try {
+      await adapter.stopDiscovery();
+    } catch (e) {
+      if (debug) app.debug('[RaceBox] stopDiscovery:', e.message);
+    }
+
+    await withTimeout(device.connect(), CONNECT_TIMEOUT, 'Connection');
+
+    app.setProviderStatus('Connected. Discovering GATT services...');
+    const gatt = await withTimeout(device.gatt(), GATT_TIMEOUT, 'GATT discovery');
+    const service = await withTimeout(gatt.getPrimaryService(SERVICE_UUID), GATT_TIMEOUT, 'UART service lookup');
+    const txChar = await withTimeout(service.getCharacteristic(TX_UUID), GATT_TIMEOUT, 'TX characteristic lookup');
+    currentTxChar = txChar;
+
     rxBuffer = Buffer.alloc(0);
-    
-    if (noble.state === 'poweredOn') {
-      // Defer restart to next tick
-      setImmediate(() => {
-        noble.startScanning([], false);
-        
-        // Set scan timeout
-        if (scanTimeoutId) clearTimeout(scanTimeoutId);
-        scanTimeoutId = setTimeout(() => {
-          if (debug) app.debug('[RaceBox] Recovery scan timeout');
-          noble.stopScanning();
-          scanTimeoutId = null;
-          scanTimeoutId = setTimeout(() => {
-            scanTimeoutId = null;
-            if (!connectedPeripheral && !isConnecting) {
-              setImmediate(() => noble.startScanning([], false));
-            }
-          }, 2000);
-        }, SCAN_TIMEOUT);
-      });
+    dataPacketCount = 0;
+    lastDataTime = Date.now();
+
+    txChar.on('valuechanged', (buf) => {
+      if (gen !== sessionGeneration) return; // stale session
+      lastDataTime = Date.now();
+      if (debug && dataPacketCount === 0) app.debug('[RaceBox] First notification received, length:', buf.length);
+      processIncomingBytes(buf);
+    });
+
+    app.setProviderStatus('Subscribing to 25Hz telemetry stream...');
+    await withTimeout(txChar.startNotifications(), GATT_TIMEOUT, 'Subscription');
+
+    app.setProviderStatus('Streaming live data successfully into Signal K.');
+    if (debug) app.debug('[RaceBox] Subscribed to TX characteristic - streaming');
+
+    // Watchdog: hold the session open until stop, disconnect, or stale data
+    while (running && gen === sessionGeneration) {
+      await sleep(WATCHDOG_INTERVAL);
+      if (!running || gen !== sessionGeneration) break;
+
+      const connected = await device.isConnected().catch(() => false);
+      if (!connected) throw new Error('Device link severed');
+
+      if (Date.now() - lastDataTime > DATA_STALE_TIMEOUT) {
+        throw new Error('Data stream stalled');
+      }
+    }
+  }
+
+  async function cleanupSession(reason) {
+    if (debug) app.debug('[RaceBox] cleanupSession:', reason);
+
+    const txChar = currentTxChar;
+    const device = currentDevice;
+    const ctx = btContext;
+    currentTxChar = null;
+    currentDevice = null;
+    btContext = null;
+    rxBuffer = Buffer.alloc(0);
+
+    if (txChar) {
+      try { txChar.removeAllListeners('valuechanged'); } catch (e) {}
+      await withTimeout(txChar.stopNotifications(), 3000, 'stopNotifications').catch(() => {});
+    }
+    if (device) {
+      await withTimeout(device.disconnect(), 5000, 'disconnect').catch(() => {});
+    }
+    if (ctx) {
+      try { ctx.destroy(); } catch (e) {}
     }
   }
 
@@ -464,11 +271,6 @@ module.exports = function (app) {
 
     if (debug && dataPacketCount === 0) {
       app.debug('[RaceBox] First chunk received, length:', chunk.length, 'buffer total:', rxBuffer.length);
-    }
-
-    // Yield to event loop every 100 packets to keep Signal K responsive
-    if (dataPacketCount % 100 === 0) {
-      setImmediate(() => {});
     }
 
     while (rxBuffer.length >= 6) {
@@ -488,7 +290,7 @@ module.exports = function (app) {
       }
 
       if (rxBuffer.length < totalPacketLength) {
-        break; 
+        break;
       }
 
       const packet = rxBuffer.slice(0, totalPacketLength);
@@ -562,12 +364,12 @@ module.exports = function (app) {
     if (calibrationRequested) {
       calibrationRequested = false;
       activeOptions.offsets = { pitch: calculatedPitch, roll: calculatedRoll };
-      
+
       if (debug) {
         app.debug(`[RaceBox] CAL CAPTURED at packet ${dataPacketCount}: Roll=${calculatedRoll.toFixed(4)} rad, Pitch=${calculatedPitch.toFixed(4)} rad`);
       }
       app.setProviderStatus(`Calibration captured at packet ${dataPacketCount}. Offsets applied.`);
-      
+
       setTimeout(() => {
         app.savePluginOptions(activeOptions, (err) => {
           if (err) {
@@ -604,9 +406,9 @@ module.exports = function (app) {
     const batteryPercent = batteryByte & 0x7F;
 
     values.push(
-      { 
-        path: 'electrical.batteries.racebox.capacity.stateOfCharge', 
-        value: batteryPercent / 100 
+      {
+        path: 'electrical.batteries.racebox.capacity.stateOfCharge',
+        value: batteryPercent / 100
       },
       {
         path: 'electrical.batteries.racebox.chargingMode',
@@ -628,15 +430,15 @@ module.exports = function (app) {
     );
 
     // Only broadcast tracking and position vectors if a live, valid 2D/3D fix exists
-    if (fixStatus >= 2 && (fixStatusFlags & 0x01)) { 
+    if (fixStatus >= 2 && (fixStatusFlags & 0x01)) {
       const lon = payload.readInt32LE(24) / 10000000;
       const lat = payload.readInt32LE(28) / 10000000;
 
       const speedMms = payload.readInt32LE(48); // mm/s
-      const speedMs = speedMms / 1000;          
-      
+      const speedMs = speedMms / 1000;
+
       const headingDegreesScaled = payload.readInt32LE(52); // degrees x 100000
-      const headingRad = (headingDegreesScaled / 100000) * (Math.PI / 180); 
+      const headingRad = (headingDegreesScaled / 100000) * (Math.PI / 180);
 
       values.push(
         { path: 'navigation.position', value: { latitude: lat, longitude: lon } },
@@ -649,15 +451,6 @@ module.exports = function (app) {
     // Deliver unified delta packet to Signal K Data Broker
     if (debug && dataPacketCount === 1) {
       app.debug('[RaceBox] Sending first delta to Signal K with', values.length, 'values');
-      app.debug('[RaceBox] Delta:', JSON.stringify({
-        updates: [
-          {
-            source: { label: plugin.id },
-            timestamp: new Date().toISOString(),
-            values: values.slice(0, 3)
-          }
-        ]
-      }));
     }
 
     app.handleMessage(plugin.id, {
@@ -670,7 +463,7 @@ module.exports = function (app) {
       ]
     });
 
-    if (debug && (dataPacketCount % 25 === 0)) {
+    if (debug && (dataPacketCount % 250 === 0)) {
       app.debug(`[RaceBox] Received ${dataPacketCount} data packets, last roll=${finalRoll.toFixed(4)}`);
     }
   }
