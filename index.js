@@ -7,9 +7,10 @@ module.exports = function (app) {
   plugin.name = 'RaceBox BLE Telemetry';
   plugin.description = 'Streams 25Hz GNSS and 6-Axis IMU data from RaceBox Mini/Micro directly into Signal K';
 
-  // Strict Nordic UART Service mappings used by RaceBox
+  // Nordic UART Service mappings (RaceBox uses this standard)
   const SERVICE_UUID = '6e400001b5a3f393e0a9e50e24dcca9e'; 
-  const TX_UUID      = '6e400003b5a3f393e0a9e50e24dcca9e';      
+  const RX_UUID      = '6e400002b5a3f393e0a9e50e24dcca9e'; // Host → Device (write)
+  const TX_UUID      = '6e400003b5a3f393e0a9e50e24dcca9e'; // Device → Host (notify/read)
   
   let rxBuffer = Buffer.alloc(0);
   let connectedPeripheral = null;
@@ -49,8 +50,12 @@ module.exports = function (app) {
     if (activeOptions.rebootBluetoothStack) {
       app.setProviderStatus('Executing hardware hcitool/hciconfig reset...');
       activeOptions.rebootBluetoothStack = false;
-      app.savePluginOptions(activeOptions, () => {});
-      exec('sudo hciconfig hci0 down && sudo hciconfig hci0 up', () => {});
+      app.savePluginOptions(activeOptions, () => {
+        app.debug('Bluetooth stack reset initiated.');
+      });
+      exec('sudo hciconfig hci0 down && sudo hciconfig hci0 up', () => {
+        app.debug('hciconfig command completed.');
+      });
       return;
     }
 
@@ -123,7 +128,7 @@ module.exports = function (app) {
 
       app.setProviderStatus('Connected. Syncing targeted GATT profile...');
 
-      // Fixes the freeze: explicitly find ONLY the exact RaceBox Service UUID
+      // Explicitly find ONLY the exact RaceBox Service UUID
       peripheral.discoverServices([SERVICE_UUID], (sErr, services) => {
         if (sErr || !services || services.length === 0) {
           app.setProviderStatus('Error: Targeted RaceBox service structure not exposed.');
@@ -131,17 +136,30 @@ module.exports = function (app) {
           return;
         }
 
-        // Explicitly find ONLY the exact RaceBox TX Characteristic UUID
-        services[0].discoverCharacteristics([TX_UUID], (cErr, characteristics) => {
+        // Discover BOTH TX and RX characteristics
+        peripheral.discoverCharacteristics([TX_UUID, RX_UUID], (cErr, characteristics) => {
           isConnecting = false; 
 
-          const txChar = characteristics ? characteristics.find(c => c.uuid === TX_UUID) : null;
-          if (cErr || !txChar) {
-            app.setProviderStatus('Error: Core telemetry stream characteristic not found.');
+          if (cErr || !characteristics) {
+            app.setProviderStatus('Error: Could not discover RaceBox characteristics.');
             cleanupAndRestartScan();
             return;
           }
 
+          const txChar = characteristics.find(c => c.uuid === TX_UUID);
+          const rxChar = characteristics.find(c => c.uuid === RX_UUID);
+
+          if (!txChar) {
+            app.setProviderStatus('Error: TX characteristic (data stream) not found.');
+            cleanupAndRestartScan();
+            return;
+          }
+
+          if (!rxChar) {
+            app.debug('Warning: RX characteristic not found. Device may not accept commands.');
+          }
+
+          // Subscribe to TX (device → host data stream)
           app.setProviderStatus('Subscribing to 25Hz telemetry stream...');
           txChar.subscribe((subErr) => {
             if (subErr) {
@@ -240,8 +258,13 @@ module.exports = function (app) {
       calibrationRequested = false;
       activeOptions.zeroImuNow = false;
       activeOptions.offsets = { pitch: calculatedPitch, roll: calculatedRoll };
-      app.savePluginOptions(activeOptions, () => {
-        app.debug('Boat alignment calibration successful.');
+      app.savePluginOptions(activeOptions, (err) => {
+        if (err) {
+          app.error('Failed to save calibration offsets:', err);
+        } else {
+          app.debug('Boat alignment calibration successful.');
+          app.setProviderStatus('Calibration complete. Roll and Pitch offsets saved.');
+        }
       });
     }
 
