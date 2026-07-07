@@ -15,115 +15,81 @@ module.exports = function (app) {
   let messageCount = 0;
   let statusInterval = null;
   let activeOptions = {};
+  let performCalibrationNextPacket = false;
 
-  // --- 1. Signal K Configuration Schema ---
+  // --- 1. Interactive Configuration Schema ---
   plugin.schema = {
     type: 'object',
     properties: {
       enableIMU: {
         type: 'boolean',
-        title: 'Enable IMU Data streaming (G-Forces)',
+        title: 'Enable IMU Streaming (Pitch, Roll, Rate of Turn)',
         default: true
+      },
+      triggerCalibration: {
+        type: 'boolean',
+        title: '👉 CALIBRATE IMU NOW (Check this box and click Save while the boat is floating naturally at rest to zero out Pitch, Roll, and Yaw-rate offsets)',
+        default: false
+      },
+      triggerBleReset: {
+        type: 'boolean',
+        title: '🔄 FORCE BLUETOOTH RESET (Check this box and click Save to hard-reboot the system Bluetooth stack and force a fresh device scan)',
+        default: false
       },
       calibrationOffsets: {
         type: 'object',
-        title: 'Stored Calibration Offsets (Set via Calibration button)',
+        title: 'Current Saved Calibration Offsets',
         properties: {
-          x: { type: 'number', default: 0 },
-          y: { type: 'number', default: 0 },
-          z: { type: 'number', default: 0 }
+          pitch: { type: 'number', default: 0 },
+          roll: { type: 'number', default: 0 },
+          yawRate: { type: 'number', default: 0 }
         }
       }
     }
   };
 
-  // --- 2. Plugin Lifecycle ---
+  // --- 2. Plugin Lifecycle Management ---
   plugin.start = function (options, restartPlugin) {
     app.debug('RaceBox plugin starting...');
-    activeOptions = options || { enableIMU: true, calibrationOffsets: { x: 0, y: 0, z: 0 } };
-    app.setProviderStatus('Initializing Bluetooth...');
+    activeOptions = options || { enableIMU: true, calibrationOffsets: { pitch: 0, roll: 0, yawRate: 0 } };
 
-    // CRITICAL: Clear any existing listeners on the global Noble singleton before binding new ones
+    // Handle Bluetooth Reset Action
+    if (activeOptions.triggerBleReset) {
+      app.setProviderStatus('Executing hard Bluetooth interface cycle...');
+      activeOptions.triggerBleReset = false;
+      app.savePluginOptions(activeOptions, () => {});
+      
+      exec('sudo hciconfig hci0 down && sudo hciconfig hci0 up', (err) => {
+        if (err) app.error(`Bluetooth hard reset failed: ${err.message}`);
+        setTimeout(() => { restartPlugin(activeOptions); }, 2000);
+      });
+      return; 
+    }
+
+    // Set Calibration Flag if requested
+    if (activeOptions.triggerCalibration) {
+      performCalibrationNextPacket = true;
+      app.setProviderStatus('Awaiting next telemetry frame to calibrate...');
+    } else {
+      app.setProviderStatus('Initializing Bluetooth discovery...');
+    }
+
+    // Clean up older listeners from the global singleton before rebinding
     noble.removeAllListeners('stateChange');
     noble.removeAllListeners('discover');
 
     noble.on('stateChange', handleBluetoothState);
     noble.on('discover', handleDiscovery);
 
-    // Check immediate state
+    // Initial state trigger
     handleBluetoothState(noble.state);
 
     statusInterval = setInterval(() => {
       if (connectedDevice && messageCount > 0) {
-        app.setProviderStatus(`Connected to ${connectedDevice.advertisement.localName} (Receiving data)`);
+        app.setProviderStatus(`Connected to ${connectedDevice.advertisement.localName} (Streaming data)`);
         messageCount = 0;
       }
     }, 5000);
-
-    // --- 3. Custom HTTP Endpoints for Config Page Functionality ---
-    // Re-registers endpoints for your custom config page UI buttons
-    
-    // Bluetooth Reset Endpoint
-    app.post('/plugins/racebox-signalk-plugin/reset-ble', (req, res) => {
-      app.debug('Manual Bluetooth Reset triggered via config page.');
-      app.setProviderStatus('Resetting local Bluetooth interface...');
-      
-      plugin.stop();
-      
-      // Attempt hardware/software cycling of the local hci0 interface (Linux/Pi)
-      exec('sudo hciconfig hci0 down && sudo hciconfig hci0 up', (err, stdout, stderr) => {
-        if (err) {
-          app.error(`Failed to hard reset hci0 interface: ${err.message}`);
-          // Fallback to just turning scanning off/on
-        }
-        setTimeout(() => {
-          plugin.start(activeOptions, restartPlugin);
-          res.json({ status: 'success', message: 'Bluetooth interface cycled successfully.' });
-        }, 2000);
-      });
-    });
-
-    // Zero-Imu Calibration Endpoint
-    app.post('/plugins/racebox-signalk-plugin/calibrate', (req, res) => {
-      app.debug('IMU Calibration request received.');
-      if (!connectedDevice) {
-        return res.status(400).json({ status: 'error', message: 'Device must be connected to calibrate.' });
-      }
-
-      // Temporarily intercept the next clean packet to capture raw baseline forces
-      const captureCalibration = (chunk) => {
-        // Look for data frame matching telemetry
-        if (chunk.length >= 80 && chunk[0] === 0xB5 && chunk[1] === 0x62 && chunk[2] === 0xFF && chunk[3] === 0x01) {
-          const payload = chunk.slice(6, 86);
-          const rawX = payload.readInt16LE(40) / 1000;
-          const rawY = payload.readInt16LE(42) / 1000;
-          const rawZ = payload.readInt16LE(44) / 1000;
-
-          // Save current positions as the baseline offsets
-          activeOptions.calibrationOffsets = { x: rawX, y: rawY, z: rawZ - 1.0 }; // Account for normal gravity on Z
-          app.savePluginOptions(activeOptions, () => {
-            app.debug(`Calibrated offsets saved: X=${rawX}, Y=${rawY}, Z=${rawZ - 1.0}`);
-          });
-
-          // Unhook temporary interceptor
-          const txChar = connectedDevice.services
-            .find(s => s.uuid === RACEBOX_SERVICE_UUID)
-            ?.characteristics.find(c => c.uuid === RACEBOX_TX_UUID);
-          if (txChar) txChar.removeListener('data', captureCalibration);
-        }
-      };
-
-      const txChar = connectedDevice.services
-        .find(s => s.uuid === RACEBOX_SERVICE_UUID)
-        ?.characteristics.find(c => c.uuid === RACEBOX_TX_UUID);
-
-      if (txChar) {
-        txChar.on('data', captureCalibration);
-        res.json({ status: 'success', message: 'Calibration sample requested. Keep device level.' });
-      } else {
-        res.status(500).json({ status: 'error', message: 'Could not access telemetry stream for calibration.' });
-      }
-    });
   };
 
   plugin.stop = function () {
@@ -137,7 +103,7 @@ module.exports = function (app) {
       try {
         connectedDevice.disconnect();
       } catch (e) {
-        app.debug(`Disconnect cleanup error: ${e.message}`);
+        app.debug(`Disconnect error: ${e.message}`);
       }
     }
     noble.stopScanning();
@@ -145,13 +111,15 @@ module.exports = function (app) {
     app.setProviderStatus('Stopped');
   };
 
-  // --- 4. Core BLE Stream Logic ---
+  // --- 3. BLE Connectivity ---
   function handleBluetoothState(state) {
     if (state === 'poweredOn') {
-      app.setProviderStatus('Scanning for RaceBox devices...');
-      noble.startScanning([], false); 
+      if (!connectedDevice) {
+        app.setProviderStatus('Scanning for RaceBox hardware...');
+        noble.startScanning([], false); 
+      }
     } else {
-      app.setProviderStatus(`Bluetooth adapter unavailable: ${state}`);
+      app.setProviderStatus(`Bluetooth unavailable: ${state}`);
       noble.stopScanning();
     }
   }
@@ -170,41 +138,39 @@ module.exports = function (app) {
     
     peripheral.connect((error) => {
       if (error) {
-        app.setProviderStatus(`Connection error: ${error.message}`);
+        app.setProviderStatus(`Connection failed: ${error.message}`);
         retryScanning();
         return;
       }
       
-      app.setProviderStatus(`Connected to ${peripheral.advertisement.localName}. Discovering streams...`);
+      app.setProviderStatus(`Connected to ${peripheral.advertisement.localName}. Locating custom characteristics...`);
       
       peripheral.discoverSomeServicesAndCharacteristics(
         [RACEBOX_SERVICE_UUID],
         [RACEBOX_TX_UUID],
         (err, services, characteristics) => {
           if (err) {
-            app.setProviderStatus(`Discovery error: ${err.message}`);
+            app.setProviderStatus(`Service discovery error: ${err.message}`);
             retryScanning();
             return;
           }
           
           const txChar = characteristics.find(c => c.uuid === RACEBOX_TX_UUID);
           if (txChar) {
-            app.setProviderStatus('Subscribing to telemetry stream...');
-            
             txChar.subscribe((subErr) => {
               if (subErr) {
-                app.setProviderStatus(`Subscription failed: ${subErr.message}`);
+                app.setProviderStatus(`Subscription error: ${subErr.message}`);
                 retryScanning();
               } else {
-                app.setProviderStatus('Streaming live data successfully.');
+                app.setProviderStatus('Subscribed to telemetry stream successfully.');
               }
             });
             
-            txChar.on('data', (data, isNotification) => {
+            txChar.on('data', (data) => {
               processIncomingBytes(data);
             });
           } else {
-            app.setProviderStatus('Error: Required RaceBox data streams missing.');
+            app.setProviderStatus('Error: Expected RaceBox telemetry characteristics not found.');
             retryScanning();
           }
         }
@@ -212,7 +178,7 @@ module.exports = function (app) {
     });
 
     peripheral.on('disconnect', () => {
-      app.setProviderStatus('RaceBox disconnected unexpectedly. Re-scanning...');
+      app.setProviderStatus('Device link lost. Re-scanning...');
       retryScanning();
     });
   }
@@ -225,6 +191,7 @@ module.exports = function (app) {
     }
   }
 
+  // --- 4. Byte Stream Reassembly & Parsers ---
   function processIncomingBytes(chunk) {
     rxBuffer = Buffer.concat([rxBuffer, chunk]);
 
@@ -269,50 +236,83 @@ module.exports = function (app) {
   function parseRaceBoxData(payload) {
     if (payload.length < 80) return;
 
-    const fixStatus = payload.readUInt8(14); 
-    if (fixStatus < 2) return; 
+    const values = [];
 
-    const lat = payload.readInt32LE(16) / 10000000;
-    const lon = payload.readInt32LE(20) / 10000000;
-
-    const speedMms = payload.readUInt32LE(28); 
-    const speedMs = speedMms / 1000;          
-    
-    const headingDegreesScaled = payload.readInt32LE(32); 
-    const headingRad = (headingDegreesScaled / 100000) * (Math.PI / 180); 
-
-    const values = [
-      { path: 'navigation.position', value: { latitude: lat, longitude: lon } },
-      { path: 'navigation.speedOverGround', value: speedMs },
-      { path: 'navigation.courseOverGroundTrue', value: headingRad },
-      { path: 'navigation.gnss.type', value: 'GPS+GLONASS+GALILEO' }
-    ];
-
-    // Inject calibrated IMU data if enabled in config
+    // --- Part A: Handle IMU (Always stream this independent of GNSS fix!) ---
     if (activeOptions.enableIMU) {
-      const offsets = activeOptions.calibrationOffsets || { x: 0, y: 0, z: 0 };
-      const gForceX = (payload.readInt16LE(40) / 1000) - (offsets.x || 0); 
-      const gForceY = (payload.readInt16LE(42) / 1000) - (offsets.y || 0); 
-      const gForceZ = (payload.readInt16LE(44) / 1000) - (offsets.z || 0); 
+      // G-Forces scaled down to unit g from milli-g[cite: 1]
+      const gX = payload.readInt16LE(40) / 1000; 
+      const gY = payload.readInt16LE(42) / 1000; 
+      const gZ = payload.readInt16LE(44) / 1000; 
 
+      // Rotation rates converted from centi-deg/s to radians/s[cite: 1]
+      const rotZ = (payload.readInt16LE(50) / 100) * (Math.PI / 180); 
+
+      // Derive Pitch and Roll angles using standard trigonometry on the raw accelerometers
+      const rawRoll = Math.atan2(gY, gZ);
+      const rawPitch = Math.atan2(-gX, Math.sqrt(gY * gY + gZ * gZ));
+      const rawYawRate = rotZ; 
+
+      // If calibration checkbox was marked, capture current static baseline values immediately
+      if (performCalibrationNextPacket) {
+        performCalibrationNextPacket = false;
+        activeOptions.triggerCalibration = false;
+        activeOptions.calibrationOffsets = { pitch: rawPitch, roll: rawRoll, yawRate: rawYawRate };
+        
+        app.savePluginOptions(activeOptions, () => {
+          app.debug('Static natural floating calibration offsets saved.');
+        });
+      }
+
+      // Apply calibration adjustment offsets
+      const offsets = activeOptions.calibrationOffsets || { pitch: 0, roll: 0, yawRate: 0 };
+      const calibratedRoll = rawRoll - (offsets.roll || 0);
+      const calibratedPitch = rawPitch - (offsets.pitch || 0);
+      const calibratedYawRate = rawYawRate - (offsets.yawRate || 0);
+
+      // Push IMU telemetry to standard Signal K paths
       values.push(
-        { path: 'navigation.accel.x', value: gForceX },
-        { path: 'navigation.accel.y', value: gForceY },
-        { path: 'navigation.accel.z', value: gForceZ }
+        { path: 'navigation.attitude.roll', value: calibratedRoll },
+        { path: 'navigation.attitude.pitch', value: calibratedPitch },
+        { path: 'navigation.rateOfTurn', value: calibratedYawRate },
+        { path: 'navigation.accel.x', value: gX },
+        { path: 'navigation.accel.y', value: gY },
+        { path: 'navigation.accel.z', value: gZ }
       );
     }
 
-    const delta = {
-      updates: [
-        {
-          source: { label: plugin.id },
-          timestamp: new Date().toISOString(),
-          values: values
-        }
-      ]
-    };
+    // --- Part B: Handle GNSS Mapping (Conditional on valid position fix) ---
+    const fixStatus = payload.readUInt8(14); 
+    if (fixStatus >= 2) { 
+      const lat = payload.readInt32LE(16) / 10000000;
+      const lon = payload.readInt32LE(20) / 10000000;
 
-    app.handleMessage(plugin.id, delta);
+      const speedMms = payload.readUInt32LE(28); 
+      const speedMs = speedMms / 1000;          
+      
+      const headingDegreesScaled = payload.readInt32LE(32); 
+      const headingRad = (headingDegreesScaled / 100000) * (Math.PI / 180); 
+
+      values.push(
+        { path: 'navigation.position', value: { latitude: lat, longitude: lon } },
+        { path: 'navigation.speedOverGround', value: speedMs },
+        { path: 'navigation.courseOverGroundTrue', value: headingRad },
+        { path: 'navigation.gnss.type', value: 'GPS+GLONASS+GALILEO' }
+      );
+    }
+
+    // Emit live delta batch to Data Browser pipeline
+    if (values.length > 0) {
+      app.handleMessage(plugin.id, {
+        updates: [
+          {
+            source: { label: plugin.id },
+            timestamp: new Date().toISOString(),
+            values: values
+          }
+        ]
+      });
+    }
   }
 
   return plugin;
