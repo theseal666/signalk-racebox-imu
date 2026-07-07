@@ -63,6 +63,9 @@ module.exports = function (app) {
     if (activeOptions.zeroImuNow) {
       calibrationRequested = true;
       app.setProviderStatus('Armed for calibration! Awaiting next clean data packet...');
+      // Clear the flag immediately so it doesn't persist after save
+      activeOptions.zeroImuNow = false;
+      app.savePluginOptions(activeOptions, () => {});
     } else {
       app.setProviderStatus('Initializing Bluetooth subsystem...');
     }
@@ -257,15 +260,20 @@ module.exports = function (app) {
     // Live execution of boat level calibration request
     if (calibrationRequested) {
       calibrationRequested = false;
-      activeOptions.zeroImuNow = false;
       activeOptions.offsets = { pitch: calculatedPitch, roll: calculatedRoll };
-      app.savePluginOptions(activeOptions, (err) => {
-        if (err) {
-          app.error('Failed to save calibration offsets:', err);
-        } else {
-          app.debug('Boat alignment calibration successful.');
-          app.setProviderStatus('Calibration complete. Roll and Pitch offsets saved.');
-        }
+      app.debug(`Boat alignment calibration captured: Roll=${calculatedRoll.toFixed(4)} rad, Pitch=${calculatedPitch.toFixed(4)} rad`);
+      app.setProviderStatus('Calibration captured! Offsets will be applied immediately.');
+      
+      // Save asynchronously WITHOUT triggering a plugin restart
+      // Use setImmediate to avoid blocking data stream
+      setImmediate(() => {
+        app.savePluginOptions(activeOptions, (err) => {
+          if (err) {
+            app.error('Failed to persist calibration offsets:', err);
+          } else {
+            app.debug('Calibration offsets persisted to config.');
+          }
+        });
       });
     }
 
@@ -333,8 +341,8 @@ module.exports = function (app) {
       );
     }
 
-    // Deliver unified update packet right to the Signal K Data Browser
-    app.handleMessage(plugin.id, {
+    // Deliver unified delta packet to Signal K Data Broker
+    app.handleDelta({
       updates: [
         {
           source: { label: plugin.id },
