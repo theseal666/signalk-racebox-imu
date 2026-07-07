@@ -6,18 +6,19 @@ module.exports = function (app) {
   let connectedDevice = null;
 
   // Variables to hold live telemetry parsed from your BLE buffer streams
+  // Initialized cleanly with NO mock/fake data.
   let liveTelemetry = {
     latitude: null,
     longitude: null,
-    satellites: 0,
+    satellites: null,
     gpsAccuracy: null, // Horizontal accuracy in meters
     cog: null,         // Course Over Ground in Radians
     sog: null,         // Speed Over Ground in m/s
-    roll: 0.0,         // Radians
-    pitch: 0.0,        // Radians
-    waveHeight: 0.0,   // Meters
-    wavePeriod: 0.0,   // Seconds
-    batteryVoltage: 0.0
+    roll: 0.0,         // Radians (Streams immediately)
+    pitch: 0.0,        // Radians (Streams immediately)
+    waveHeight: 0.0,   // Meters (Streams immediately)
+    wavePeriod: 0.0,   // Seconds (Streams immediately)
+    batteryVoltage: 0.0 // Volts (Streams immediately)
   };
 
   plugin.id = 'signalk-racebox-imu';
@@ -53,11 +54,7 @@ module.exports = function (app) {
     // Check if the user flagged the configuration settings calibration checkbox
     if (options.calibrateGyro) {
       app.setProviderStatus('Executing IMU Gyro Calibration sequence... Keep craft completely level!');
-      
       // --- INSERT BLE WRITE COMMANDS FOR CALIBRATION ROUTINE HERE ---
-      // e.g., calibrationCharacteristic.write(Buffer.from([0xXX, 0xXX]), true);
-      
-      // Reset the configuration setting value back to false so it doesn't loop trigger on subsequent runs
       options.calibrateGyro = false;
     }
     
@@ -72,47 +69,62 @@ module.exports = function (app) {
         app.setProviderStatus(targetMac ? `Targeting locked device [${targetMac}]...` : 'Scanning for closest RaceBox Mini/Micro...');
       }
 
-      // Build the values array dynamically, omitting paths if GPS fix is lost (null)
-      let valuesArray = [
-        { path: 'electrical.batteries.racebox.voltage', value: liveTelemetry.batteryVoltage },
-        { path: 'navigation.attitude.pitch', value: liveTelemetry.pitch },
-        { path: 'navigation.attitude.roll', value: liveTelemetry.roll },
-        { path: 'environment.wind.waveHeight', value: liveTelemetry.waveHeight },
-        { path: 'environment.wind.wavePeriod', value: liveTelemetry.wavePeriod }
-      ];
+      // Build the values array dynamically based purely on current data availability
+      let valuesArray = [];
 
-      // Only push GPS telemetry paths if we have a valid structural fix data payload
-      if (liveTelemetry.latitude !== null && liveTelemetry.longitude !== null) {
-        valuesArray.push({
-          path: 'navigation.position',
-          value: { latitude: liveTelemetry.latitude, longitude: liveTelemetry.longitude }
-        });
+      // --- ALWAYS STREAM (Non-GPS Dependent Data) ---
+      if (liveTelemetry.batteryVoltage !== null) {
+        valuesArray.push({ path: 'electrical.batteries.racebox.voltage', value: liveTelemetry.batteryVoltage });
       }
+      if (liveTelemetry.pitch !== null) {
+        valuesArray.push({ path: 'navigation.attitude.pitch', value: liveTelemetry.pitch });
+      }
+      if (liveTelemetry.roll !== null) {
+        valuesArray.push({ path: 'navigation.attitude.roll', value: liveTelemetry.roll });
+      }
+      if (liveTelemetry.waveHeight !== null) {
+        valuesArray.push({ path: 'environment.wind.waveHeight', value: liveTelemetry.waveHeight });
+      }
+      if (liveTelemetry.wavePeriod !== null) {
+        valuesArray.push({ path: 'environment.wind.wavePeriod', value: liveTelemetry.wavePeriod });
+      }
+
+      // --- STREAM IF AVAILABLE (GNSS Status metadata) ---
       if (liveTelemetry.satellites !== null) {
         valuesArray.push({ path: 'navigation.gnss.satellites', value: liveTelemetry.satellites });
       }
       if (liveTelemetry.gpsAccuracy !== null) {
         valuesArray.push({ path: 'navigation.gnss.horizontalAccuracy', value: liveTelemetry.gpsAccuracy });
       }
-      if (liveTelemetry.cog !== null) {
-        valuesArray.push({ path: 'navigation.courseOverGroundTrue', value: liveTelemetry.cog });
-      }
-      if (liveTelemetry.sog !== null) {
-        valuesArray.push({ path: 'navigation.speedOverGround', value: liveTelemetry.sog });
+
+      // --- ONLY STREAM IF GPS FIX IS VALID (Omit entirely if null, undefined, or 0 position) ---
+      if (liveTelemetry.latitude !== null && liveTelemetry.longitude !== null && liveTelemetry.latitude !== 0 && liveTelemetry.longitude !== 0) {
+        valuesArray.push({
+          path: 'navigation.position',
+          value: { latitude: liveTelemetry.latitude, longitude: liveTelemetry.longitude }
+        });
+        
+        if (liveTelemetry.cog !== null) {
+          valuesArray.push({ path: 'navigation.courseOverGroundTrue', value: liveTelemetry.cog });
+        }
+        if (liveTelemetry.sog !== null) {
+          valuesArray.push({ path: 'navigation.speedOverGround', value: liveTelemetry.sog });
+        }
       }
 
-      let delta = {
-        updates: [
-          {
-            source: { label: plugin.id },
-            timestamp: new Date().toISOString(),
-            values: valuesArray
-          }
-        ]
-      };
-
-      // Dispatches the update down to the Signal K Data Browser core
-      app.handleMessage(plugin.id, delta);
+      // Only dispatch to core if paths are ready to be sent
+      if (valuesArray.length > 0) {
+        let delta = {
+          updates: [
+            {
+              source: { label: plugin.id },
+              timestamp: new Date().toISOString(),
+              values: valuesArray
+            }
+          ]
+        };
+        app.handleMessage(plugin.id, delta);
+      }
     }, 1000);
 
     // --- 3. INITIALIZE NOBLE BLE DRIVERS ---
@@ -148,17 +160,35 @@ module.exports = function (app) {
             
             app.setProviderStatus(`Connected to ${name} (${peripheral.address})! Streaming telemetry...`);
             
-            // ➡️ NOTE: INSIDE YOUR NOBLE CHARACTERISTIC NOTIFICATION CALLBACK LOOP:
-            // Parse your raw byte arrays and update the 'liveTelemetry' object parameters directly!
-            // Example:
-            // liveTelemetry.pitch = parsedPitchInRadians;
-            // liveTelemetry.latitude = parsedLatitudeDegrees;
-            // liveTelemetry.satellites = parsedSatCountByte;
-            // liveTelemetry.gpsAccuracy = parsedAccuracyInMeters;
+            // ➡️ PASTE YOUR BLE CHARACTERISTIC NOTIFICATION PARSER HERE:
+            // Inside your noble data handler callback, update the properties directly:
+            // 
+            // characteristic.on('data', (data, isNotification) => {
+            //   // 1. Unpack your buffer bytes here...
+            //   // 2. Map directly to the live tracking object:
+            //   liveTelemetry.pitch = parsedPitchInRadians;
+            //   liveTelemetry.roll = parsedRollInRadians;
+            //   liveTelemetry.batteryVoltage = parsedVoltage;
+            //
+            //   // 3. Populate these dynamically when GPS data arrives:
+            //   liveTelemetry.satellites = totalSats;
+            //   liveTelemetry.gpsAccuracy = horizontalAccuracyMeters;
+            //   liveTelemetry.latitude = parsedLatitude;
+            //   liveTelemetry.longitude = parsedLongitude;
+            //   liveTelemetry.sog = speedOverGroundMs;
+            //   liveTelemetry.cog = courseOverGroundTrueRad;
+            // });
           });
 
           peripheral.on('disconnect', () => {
             connectedDevice = null;
+            // Force reset GPS keys to null on hard disconnect so Signal K stops broadcasting expired data
+            liveTelemetry.latitude = null;
+            liveTelemetry.longitude = null;
+            liveTelemetry.satellites = null;
+            liveTelemetry.gpsAccuracy = null;
+            liveTelemetry.cog = null;
+            liveTelemetry.sog = null;
             app.setProviderStatus('RaceBox disconnected. Resuming background auto-discovery scan...');
             noble.startScanning([], true);
           });
@@ -168,7 +198,7 @@ module.exports = function (app) {
       app.setProviderStatus(`Noble Engine Crash: ${bleErr.message}`);
     }
 
-    // --- 4. ACTION PUT HOOK REGISTER (ALTERNATIVE CALIBRATION UI METHOD) ---
+    // --- 4. ACTION PUT HOOK REGISTER ---
     if (app.registerActionHandler) {
       app.registerActionHandler(
         'vessels.self',
