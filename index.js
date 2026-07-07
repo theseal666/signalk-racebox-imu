@@ -1,4 +1,5 @@
 const noble = require('@abandonware/noble');
+const { exec } = require('child_process');
 
 module.exports = function (app) {
   const plugin = {};
@@ -13,49 +14,143 @@ module.exports = function (app) {
   let connectedDevice = null;
   let messageCount = 0;
   let statusInterval = null;
+  let activeOptions = {};
 
+  // --- 1. Signal K Configuration Schema ---
+  plugin.schema = {
+    type: 'object',
+    properties: {
+      enableIMU: {
+        type: 'boolean',
+        title: 'Enable IMU Data streaming (G-Forces)',
+        default: true
+      },
+      calibrationOffsets: {
+        type: 'object',
+        title: 'Stored Calibration Offsets (Set via Calibration button)',
+        properties: {
+          x: { type: 'number', default: 0 },
+          y: { type: 'number', default: 0 },
+          z: { type: 'number', default: 0 }
+        }
+      }
+    }
+  };
+
+  // --- 2. Plugin Lifecycle ---
   plugin.start = function (options, restartPlugin) {
     app.debug('RaceBox plugin starting...');
+    activeOptions = options || { enableIMU: true, calibrationOffsets: { x: 0, y: 0, z: 0 } };
     app.setProviderStatus('Initializing Bluetooth...');
 
-    // Handle Noble state changes
+    // CRITICAL: Clear any existing listeners on the global Noble singleton before binding new ones
+    noble.removeAllListeners('stateChange');
+    noble.removeAllListeners('discover');
+
     noble.on('stateChange', handleBluetoothState);
-    
-    // Handle discovery
     noble.on('discover', handleDiscovery);
 
-    // Trigger initial state check immediately in case BLE is already powered on
+    // Check immediate state
     handleBluetoothState(noble.state);
 
-    // Set up a dashboard status reporter to show you live traffic metrics
     statusInterval = setInterval(() => {
       if (connectedDevice && messageCount > 0) {
-        app.setProviderStatus(`Connected to ${connectedDevice.advertisement.localName} (Receiving updates)`);
+        app.setProviderStatus(`Connected to ${connectedDevice.advertisement.localName} (Receiving data)`);
         messageCount = 0;
       }
     }, 5000);
+
+    // --- 3. Custom HTTP Endpoints for Config Page Functionality ---
+    // Re-registers endpoints for your custom config page UI buttons
+    
+    // Bluetooth Reset Endpoint
+    app.post('/plugins/racebox-signalk-plugin/reset-ble', (req, res) => {
+      app.debug('Manual Bluetooth Reset triggered via config page.');
+      app.setProviderStatus('Resetting local Bluetooth interface...');
+      
+      plugin.stop();
+      
+      // Attempt hardware/software cycling of the local hci0 interface (Linux/Pi)
+      exec('sudo hciconfig hci0 down && sudo hciconfig hci0 up', (err, stdout, stderr) => {
+        if (err) {
+          app.error(`Failed to hard reset hci0 interface: ${err.message}`);
+          // Fallback to just turning scanning off/on
+        }
+        setTimeout(() => {
+          plugin.start(activeOptions, restartPlugin);
+          res.json({ status: 'success', message: 'Bluetooth interface cycled successfully.' });
+        }, 2000);
+      });
+    });
+
+    // Zero-Imu Calibration Endpoint
+    app.post('/plugins/racebox-signalk-plugin/calibrate', (req, res) => {
+      app.debug('IMU Calibration request received.');
+      if (!connectedDevice) {
+        return res.status(400).json({ status: 'error', message: 'Device must be connected to calibrate.' });
+      }
+
+      // Temporarily intercept the next clean packet to capture raw baseline forces
+      const captureCalibration = (chunk) => {
+        // Look for data frame matching telemetry
+        if (chunk.length >= 80 && chunk[0] === 0xB5 && chunk[1] === 0x62 && chunk[2] === 0xFF && chunk[3] === 0x01) {
+          const payload = chunk.slice(6, 86);
+          const rawX = payload.readInt16LE(40) / 1000;
+          const rawY = payload.readInt16LE(42) / 1000;
+          const rawZ = payload.readInt16LE(44) / 1000;
+
+          // Save current positions as the baseline offsets
+          activeOptions.calibrationOffsets = { x: rawX, y: rawY, z: rawZ - 1.0 }; // Account for normal gravity on Z
+          app.savePluginOptions(activeOptions, () => {
+            app.debug(`Calibrated offsets saved: X=${rawX}, Y=${rawY}, Z=${rawZ - 1.0}`);
+          });
+
+          // Unhook temporary interceptor
+          const txChar = connectedDevice.services
+            .find(s => s.uuid === RACEBOX_SERVICE_UUID)
+            ?.characteristics.find(c => c.uuid === RACEBOX_TX_UUID);
+          if (txChar) txChar.removeListener('data', captureCalibration);
+        }
+      };
+
+      const txChar = connectedDevice.services
+        .find(s => s.uuid === RACEBOX_SERVICE_UUID)
+        ?.characteristics.find(c => c.uuid === RACEBOX_TX_UUID);
+
+      if (txChar) {
+        txChar.on('data', captureCalibration);
+        res.json({ status: 'success', message: 'Calibration sample requested. Keep device level.' });
+      } else {
+        res.status(500).json({ status: 'error', message: 'Could not access telemetry stream for calibration.' });
+      }
+    });
   };
 
   plugin.stop = function () {
     app.debug('RaceBox plugin stopping...');
     if (statusInterval) clearInterval(statusInterval);
     
-    noble.removeListener('stateChange', handleBluetoothState);
-    noble.removeListener('discover', handleDiscovery);
+    noble.removeAllListeners('stateChange');
+    noble.removeAllListeners('discover');
     
     if (connectedDevice) {
-      connectedDevice.disconnect();
+      try {
+        connectedDevice.disconnect();
+      } catch (e) {
+        app.debug(`Disconnect cleanup error: ${e.message}`);
+      }
     }
     noble.stopScanning();
+    connectedDevice = null;
     app.setProviderStatus('Stopped');
   };
 
+  // --- 4. Core BLE Stream Logic ---
   function handleBluetoothState(state) {
     if (state === 'poweredOn') {
       app.setProviderStatus('Scanning for RaceBox devices...');
-      // Scan broadly without UUID restrictions so we don't miss the advertisement
       noble.startScanning([], false); 
-    } else if (state === 'poweredOff' || state === 'unauthorized' || state === 'unsupported') {
+    } else {
       app.setProviderStatus(`Bluetooth adapter unavailable: ${state}`);
       noble.stopScanning();
     }
@@ -80,7 +175,7 @@ module.exports = function (app) {
         return;
       }
       
-      app.setProviderStatus(`Connected to ${peripheral.advertisement.localName}. Discovering telemetry streams...`);
+      app.setProviderStatus(`Connected to ${peripheral.advertisement.localName}. Discovering streams...`);
       
       peripheral.discoverSomeServicesAndCharacteristics(
         [RACEBOX_SERVICE_UUID],
@@ -109,7 +204,7 @@ module.exports = function (app) {
               processIncomingBytes(data);
             });
           } else {
-            app.setProviderStatus('Error: Required RaceBox data streams not found on device.');
+            app.setProviderStatus('Error: Required RaceBox data streams missing.');
             retryScanning();
           }
         }
@@ -130,12 +225,10 @@ module.exports = function (app) {
     }
   }
 
-  // FIFO Buffer Processor to re-assemble fragmented BLE packets
   function processIncomingBytes(chunk) {
     rxBuffer = Buffer.concat([rxBuffer, chunk]);
 
     while (rxBuffer.length >= 6) {
-      // Find sync headers: 0xB5 0x62
       if (rxBuffer[0] !== 0xB5 || rxBuffer[1] !== 0x62) {
         rxBuffer = rxBuffer.slice(1);
         continue;
@@ -147,7 +240,7 @@ module.exports = function (app) {
       const totalPacketLength = 6 + payloadLength + 2; 
 
       if (rxBuffer.length < totalPacketLength) {
-        break; // Wait for the rest of the bytes to arrive
+        break; 
       }
 
       const packet = rxBuffer.slice(0, totalPacketLength);
@@ -173,7 +266,6 @@ module.exports = function (app) {
     return ckA === checksumBytes[0] && ckB === checksumBytes[1];
   }
 
-  // Parse fields out of the 80-byte data payload
   function parseRaceBoxData(payload) {
     if (payload.length < 80) return;
 
@@ -189,24 +281,33 @@ module.exports = function (app) {
     const headingDegreesScaled = payload.readInt32LE(32); 
     const headingRad = (headingDegreesScaled / 100000) * (Math.PI / 180); 
 
-    const gForceX = payload.readInt16LE(40) / 1000; 
-    const gForceY = payload.readInt16LE(42) / 1000; 
-    const gForceZ = payload.readInt16LE(44) / 1000; 
+    const values = [
+      { path: 'navigation.position', value: { latitude: lat, longitude: lon } },
+      { path: 'navigation.speedOverGround', value: speedMs },
+      { path: 'navigation.courseOverGroundTrue', value: headingRad },
+      { path: 'navigation.gnss.type', value: 'GPS+GLONASS+GALILEO' }
+    ];
+
+    // Inject calibrated IMU data if enabled in config
+    if (activeOptions.enableIMU) {
+      const offsets = activeOptions.calibrationOffsets || { x: 0, y: 0, z: 0 };
+      const gForceX = (payload.readInt16LE(40) / 1000) - (offsets.x || 0); 
+      const gForceY = (payload.readInt16LE(42) / 1000) - (offsets.y || 0); 
+      const gForceZ = (payload.readInt16LE(44) / 1000) - (offsets.z || 0); 
+
+      values.push(
+        { path: 'navigation.accel.x', value: gForceX },
+        { path: 'navigation.accel.y', value: gForceY },
+        { path: 'navigation.accel.z', value: gForceZ }
+      );
+    }
 
     const delta = {
       updates: [
         {
           source: { label: plugin.id },
           timestamp: new Date().toISOString(),
-          values: [
-            { path: 'navigation.position', value: { latitude: lat, longitude: lon } },
-            { path: 'navigation.speedOverGround', value: speedMs },
-            { path: 'navigation.courseOverGroundTrue', value: headingRad },
-            { path: 'navigation.gnss.type', value: 'GPS+GLONASS+GALILEO' },
-            { path: 'navigation.accel.x', value: gForceX },
-            { path: 'navigation.accel.y', value: gForceY },
-            { path: 'navigation.accel.z', value: gForceZ }
-          ]
+          values: values
         }
       ]
     };
