@@ -22,7 +22,7 @@ Because this plugin utilizes Bluetooth Low Energy (`@abandonware/noble`), the ho
 ### 1. Install System Packages
 Run the following command on your Raspberry Pi terminal to install the necessary BLE development libraries:
 
-bash
+```bash
 sudo apt-get install bluetooth bluez libbluetooth-dev libudev-dev
 2. Grant Permissions to Node.js (Crucial for Raspberry Pi)
 By default, Linux prevents non-root applications (like the Node.js process running Signal K) from accessing the Bluetooth controller interface. Grant the required permissions by running:
@@ -50,6 +50,26 @@ Restart your Signal K server:
 Bash
 sudo systemctl restart signalk
 Configuration
+Go to Plugin Config in the Signal K side menu.
+Select RaceBox BLE Telemetry Bridge.
+Turn on the plugin.
+Adaptive Wave Window: Set your target window length (default: 8 seconds). Shorter windows respond quickly to short chop; longer windows capture deep ocean swells accurately.
+Hit Submit/Save.
+Connecting & Resetting
+Auto-Discovery: On boot, the plugin scans for any local hardware broadcasting as a RaceBox device. When it finds one, it locks its MAC address permanently into the configuration file so it ignores other devices in a busy marina.
+The Reset Switch: If you swap to a different RaceBox unit on your boat, check the Reset & Force Scan box and click Save. The plugin will clear its memory, disconnect from the old device, and pair with the new unit immediately.
+Signal K Paths Emitted
+The plugin outputs data to the following deltas:
+navigation.position (Latitude/Longitude)
+navigation.gnss.satellites (Number of connected satellites)
+navigation.courseOverGroundTrue (Radians)
+navigation.speedOverGround (m/s)
+navigation.attitude.roll (Radians)
+navigation.attitude.pitch (Radians)
+environment.wind.waveHeight (Significant crest-to-trough wave height in meters)
+environment.wind.wavePeriod (Dominant period in seconds)
+License
+MIT License. Feel free to use, modify, and distribute.Configuration
 Go to Plugin Config in the Signal K side menu.
 Select RaceBox BLE Telemetry Bridge.
 Turn on the plugin.
