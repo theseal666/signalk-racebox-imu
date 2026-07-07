@@ -1,6 +1,3 @@
-Ah, my bad! Let's get that fixed up so it displays as a clean, copy-pasteable Markdown block. Here is the entire `README.md` properly escaped and formatted for your GitHub repository:
-
-```markdown
 # signalk-racebox-imu
 
 A Signal K plugin to auto-discover, pair, and stream telemetry from a **RaceBox Mini** or **RaceBox Micro** over Bluetooth Low Energy (BLE). 
