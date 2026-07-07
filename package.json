@@ -1,0 +1,20 @@
+{
+  "name": "signalk-racebox-micro",
+  "version": "1.0.0",
+  "description": "Signal K plugin for Racebox Micro 25Hz GPS and IMU",
+  "main": "index.js",
+  "signalk-plugin": {
+    "name": "Racebox Micro"
+  },
+  "keywords": [
+    "signalk-node-server-plugin",
+    "signalk",
+    "racebox",
+    "gps",
+    "imu"
+  ],
+  "dependencies": {
+    "@abandonware/noble": "^1.9.2", 
+    "serialport": "^12.0.0"
+  }
+}
