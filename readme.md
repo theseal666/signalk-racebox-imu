@@ -81,7 +81,7 @@ Replace `theseal666` with your actual Linux username if it differs from your Git
 
 ```bash
 cd ~/.signalk
-npm install github:theseal666/signalk-racebox-imu
+npm install github:theseal666/signalk-racebox-imu#feature/wave-detection
 sudo systemctl restart signalk
 ```
 
@@ -175,7 +175,7 @@ The plugin detects the device model from its advertised name and publishes the c
 
 ## Development
 
-1. Clone the repository, modify `index.js`, test on a Pi running Signal K (`npm install <path-or-git-url>` in `~/.signalk`).
+1. Clone the repository, modify `index.js`, test on a Pi running Signal K (`npm install https://github.com/theseal666/signalk-racebox-imu.git#feature/wave-detection` in `~/.signalk`).
 2. The RaceBox protocol: UBX-framed packets (`0xB5 0x62`) over the Nordic UART service (`6e400001-b5a3-f393-e0a9-e50e24dcca9e`), TX characteristic notifications, Fletcher-8 checksum. The 80-byte `0xFF 0x01` data message layout is implemented in `parseRaceBoxData()` and matches the official *RaceBox BLE Protocol Description rev 8*.
 3. Packets may be split or merged across BLE notifications — the reassembly buffer in `processIncomingBytes()` handles this.
 
