@@ -366,12 +366,18 @@ module.exports = function (app) {
         const now = Date.now();
         const halfPeriod = (now - lastWaveTime) / 1000;
 
-        if (waveHeight > 0.05 && halfPeriod > 0.2) {
+        // More robust noise filters:
+        // 1. Minimum wave height (0.1m) to filter out table vibrations/noise
+        // 2. Minimum half-period (0.5s) to filter out high-frequency noise
+        // 3. Ensure we have enough data points (dataPacketCount > some threshold)
+        if (waveHeight > 0.1 && halfPeriod > 0.5 && halfPeriod < 10) {
           values.push(
             { path: 'environment.wind.waveHeight', value: waveHeight },
             { path: 'environment.wind.wavePeriod', value: halfPeriod * 2 }
           );
         }
+
+        // Reset for next half-cycle
         maxDisplacement = displacementZ;
         minDisplacement = displacementZ;
         lastWaveTime = now;
