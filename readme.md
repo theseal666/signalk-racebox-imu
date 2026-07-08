@@ -22,10 +22,10 @@ This plugin parses the RaceBox binary protocol (UBX-framed, per the official *Ra
 ## Screenshots
 
 ### Plugin Configuration
-![Plugin Settings](images/settings.png)
+![Plugin Settings](images/data-browser.png)
 
 ### Live Data Stream
-![Data Browser](images/data-browser.png)
+![Data Browser](images/settings.png)
 
 ### Connection Status
 ![Connection Status](images/status.png)
