@@ -14,7 +14,7 @@ This plugin parses the RaceBox binary protocol (UBX-framed, per the official *Ra
 * **Zero Configuration Pairing:** Auto-discovers and connects to the first device advertising as "RaceBox".
 * **Full Telemetry Mapping:** Position, SOG, COG, Pitch, Roll, satellite count, battery status, and GPS accuracy.
 * **6-Axis IMU Streaming:** Raw accelerometer (X/Y/Z) and gyroscope (X/Y/Z) data at 25Hz.
-* **Experimental Wave & Slam Detection:** Advanced math (True Z rotation + leaky integration) to estimate wave height, period, and detect hull slams.
+* **Experimental Wave & Slam Detection:** Advanced math (True Z rotation + leaky integration) to estimate wave height, period, and detect complex hull slams.
 * **High-Quality Codebase:** Decoupled metadata and automated unit tests for reliability and a high Signal K Registry score.
 
 ---
@@ -32,26 +32,41 @@ This plugin parses the RaceBox binary protocol (UBX-framed, per the official *Ra
 
 ---
 
-## Experimental: Wave & Performance Detection
+## Signal K Paths Emitted
 
-This plugin performs real-time processing of the 25Hz IMU stream to derive advanced metrics:
+The plugin publishes the following paths to the Signal K Delta stream at up to 25Hz:
 
-### 1. True Vertical Acceleration (True Z)
-To isolate actual vertical motion from the boat's rotation, the plugin performs a 3D rotation of the raw accelerometer data into an Earth-fixed frame using the current Pitch and Roll.
-* **Path:** `navigation.accel.trueZ` (g)
-* **Math:** $a_z^{earth} = -a_x \sin(P) + a_y \sin(R)\cos(P) + a_z \cos(R)\cos(P)$
+### Navigation – Core Telemetry
+* `navigation.position` — Latitude/Longitude (degrees)
+* `navigation.speedOverGround` — Speed over ground (m/s)
+* `navigation.courseOverGroundTrue` — Course over ground (radians, 0 = North)
+* `navigation.attitude.roll` — Calibrated Roll angle (radians)
+* `navigation.attitude.pitch` — Calibrated Pitch angle (radians)
+* `navigation.rateOfTurn` — Turning rate from gyro Z (rad/s)
+* `navigation.gnss.type` — Constellation in use (GPS+GLONASS+GALILEO)
+* `navigation.gnss.satellites` — Number of satellites in view
+* `navigation.gnss.horizontalDilution` — HDOP
+* `navigation.gnss.positionError` — Horizontal accuracy estimate (meters)
 
-### 2. Wave Height & Period
-Estimating wave height from acceleration requires double-integration. This plugin uses a **Leaky Integration (High-Pass Filter)** approach to prevent drift:
-* **Paths:** `environment.wind.waveHeight` (m), `environment.wind.wavePeriod` (s)
-* **Logic:** The boat's Pitch cycle identifies wave start/peak/end. We integrate vertical acceleration to velocity, then displacement. Wave height is the peak-to-peak displacement within each pitch-detected half-cycle.
-* **Persistence:** Metrics are reported at 25Hz and auto-reset to `0` after 20s of inactivity.
+### Navigation – Raw IMU (25Hz)
+* `navigation.accel.x`, `.y`, `.z` — Raw accelerometer (g)
+* `navigation.gyro.x`, `.y`, `.z` — Raw gyroscope (rad/s)
 
-### 3. Complex Slam Detection
-* **Path:** `performance.hull.slamAcceleration` (g), `performance.hull.slamAngularJolt` (rad/s²)
-* **Logic:** Instead of just vertical motion, the plugin now monitors the **3D G-Force Resultant** vector. This captures impacts from the side (beam seas), bow-on slams, or sudden decelerations.
-* **Angular Jolt:** Captures sudden, violent changes in the boat's rotation rates (Pitch/Roll/Yaw), which often accompany a significant hull slam.
-* **Persistence:** Slams use a 1-second peak-hold to ensure they are registered in logs.
+### Experimental: Wave & Performance Detection
+*These paths are persistently reported at 25Hz when enabled in the settings.*
+
+* `navigation.accel.trueZ` — Earth-fixed vertical acceleration (g). Isolates vertical motion from boat rotation using 3D rotation math.
+* `environment.wind.waveHeight` — Estimated peak-to-peak wave height (meters). Calculated via leaky double-integration of vertical acceleration, gated by the Pitch cycle.
+* `environment.wind.wavePeriod` — Estimated wave period (seconds).
+* `performance.hull.slamAcceleration` — Peak impact G-Force (3D Resultant). Captures impacts from any direction (side, bow, or bottom) using a 1-second peak-hold.
+* `performance.hull.slamAngularJolt` — Derivative of angular rates (rad/s²). Measures the violence of sudden orientation changes.
+
+**Note:** Wave height/period auto-reset to `0` after 20 seconds of inactivity to ensure clean logging in tools like Expedition.
+
+### Electrical & System
+* `electrical.batteries.racebox.capacity.stateOfCharge` — Battery level (0 to 1)
+* `electrical.batteries.racebox.chargingMode` — `charging` / `not charging`
+* `electrical.batteries.racebox.voltage` — Input voltage (RaceBox Micro only)
 
 ---
 
