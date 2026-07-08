@@ -181,6 +181,27 @@ The plugin detects the device model from its advertised name and publishes the c
 
 ---
 
+## Experimental: Wave & Performance Detection
+
+This branch (`feature/wave-detection`) introduces advanced real-time processing of the 25Hz IMU stream:
+
+### 1. True Vertical Acceleration (True Z)
+To isolate actual vertical motion from the boat's rotation, the plugin performs a 3D rotation of the raw accelerometer data ($a_x, a_y, a_z$) into an Earth-fixed frame using the current Pitch and Roll.
+* **Formula:** $a_z^{earth} = -a_x \sin(P) + a_y \sin(R)\cos(P) + a_z \cos(R)\cos(P)$
+* This value (minus 1.0G of gravity) provides the pure vertical acceleration of the hull.
+
+### 2. Wave Height & Period
+Estimating wave height from acceleration requires double-integration, which is inherently prone to drift. This plugin uses a **Leaky Integration (High-Pass Filter)** approach:
+* **Cycle Detection:** The boat's Pitch cycle is used to identify the start, peak, and end of waves.
+* **Calculation:** The vertical displacement is integrated from acceleration; wave height is calculated as the peak-to-peak displacement within each pitch-detected half-cycle.
+* **Filtering:** A leak factor (default 0.98) ensures the integration always returns to zero, preventing "runaway" values.
+
+### 3. Hull Slam Detection
+High-G vertical impacts (slams) are detected by monitoring the True Z acceleration.
+* **Peak Hold:** When acceleration exceeds the configurable `Slam Threshold`, the peak value is captured and "held" in the Signal K delta for 1 second to ensure it is visible on dashboards.
+
+---
+
 ## License
 
 MIT License. Feel free to use, modify, and distribute.
