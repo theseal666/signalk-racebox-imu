@@ -92,6 +92,7 @@ sudo systemctl restart signalk
 
 ### Good to know
 
+* **Config saves restart the plugin:** Signal K restarts a plugin whenever its configuration is saved, which briefly disconnects the RaceBox (~20s to reconnect). For calibration this means the offsets are captured from the first packet *after* reconnection — keep the boat level until the status shows "Calibration captured".
 * **One central at a time:** A RaceBox accepts only one BLE connection. Close the RaceBox phone app (fully — not backgrounded) or it will steal the connection from the server.
 * **Standalone recording (Mini S / Micro):** If the device is set to record at a lower rate (e.g. 1Hz), live BLE data arrives at that reduced rate too. During a memory download or erase, live data is silenced entirely.
 * **No position at startup indoors:** Position/SOG/COG are gated on a valid GNSS fix. IMU and battery data flow immediately; navigation data appears once the green (fix) LED is on.
