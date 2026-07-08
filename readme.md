@@ -1,5 +1,9 @@
 # signalk-racebox-imu
 
+<p align="center">
+  <img src="SignalK-RaceBox-IMU-plugin_logo.png" alt="Signal K RaceBox IMU plugin logo" width="300">
+</p>
+
 A Signal K plugin to auto-discover, connect, and stream telemetry from a **RaceBox Mini**, **RaceBox Mini S**, or **RaceBox Micro** over Bluetooth Low Energy (BLE).
 
 This plugin parses the RaceBox binary protocol (UBX-framed, per the official *RaceBox BLE Protocol Description rev 8*) and converts it into standard Signal K paths. Streams at 25Hz with full 6-axis IMU (accelerometer + gyroscope), GPS/GNSS position, course/speed, battery monitoring, and satellite tracking.
