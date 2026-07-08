@@ -84,6 +84,8 @@ sudo systemctl restart signalk
 * `environment.wind.wavePeriod` — Estimated wave period (s)
 * `performance.hull.slamAcceleration` — Peak vertical impact acceleration (g)
 
+**Note:** When experimental features are enabled, these paths are persistently reported at 25Hz. If no waves are detected for 20 seconds, the values will automatically reset to `0` to ensure clean logging in tools like Expedition. Slam acceleration resets to `0` after a 1-second peak-hold.
+
 ### Navigation – Core
 * `navigation.attitude.{roll, pitch}` — Calibrated orientation
 * `navigation.position`, `navigation.speedOverGround`, `navigation.courseOverGroundTrue`
