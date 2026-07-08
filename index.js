@@ -1,56 +1,19 @@
 const { createBluetooth } = require('node-ble');
 const { exec } = require('child_process');
 
-module.exports = function (app) {
-  const plugin = {};
-  plugin.id = 'signalk-racebox-imu';
-  plugin.name = 'RaceBox BLE Telemetry';
-  plugin.description = 'Streams 25Hz GNSS and 6-Axis IMU data from RaceBox Mini/Micro directly into Signal K';
+/**
+ * Signal K Plugin: RaceBox BLE Telemetry
+ * 
+ * This plugin decouples metadata from the runtime factory function to ensure 
+ * the Signal K Appstore can always load it, even if system dependencies (D-Bus)
+ * are missing or hardware is not present.
+ */
 
-  // Nordic UART Service mappings (RaceBox uses this standard)
-  // node-ble/BlueZ uses dashed lowercase UUID format
-  const SERVICE_UUID = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
-  const TX_UUID      = '6e400003-b5a3-f393-e0a9-e50e24dcca9e'; // Device → Host (notify)
-
-  // Timing configuration (ms)
-  const ADAPTER_TIMEOUT = 10000;      // waiting for the BlueZ adapter
-  const SCAN_POLL_INTERVAL = 2000;    // how often to check discovered devices
-  const CONNECT_TIMEOUT = 15000;      // GATT connection establishment
-  const GATT_TIMEOUT = 10000;         // service/characteristic discovery
-  const RETRY_DELAY = 5000;           // pause between failed sessions
-  const WATCHDOG_INTERVAL = 5000;     // connection/data health check period
-  const DATA_STALE_TIMEOUT = 15000;   // no data for this long => reconnect
-
-  let rxBuffer = Buffer.alloc(0);
-  let calibrationRequested = false;
-  let activeOptions = {};
-  let dataPacketCount = 0;
-  let debug = false;
-
-  // Session lifecycle: the main loop runs one session at a time; the
-  // generation counter invalidates callbacks from finished sessions
-  let running = false;
-  let sessionGeneration = 0;
-  let btContext = null;      // { bluetooth, destroy } from createBluetooth()
-  let currentDevice = null;
-  let currentTxChar = null;
-  let lastDataTime = 0;
-
-  \/\/ Wave detection pipeline state
-  const DT = 0.04;           \/\/ 25Hz sample rate
-  const LEAK = 0.98;         \/\/ High-pass filter leak factor for integration
-  let velocityZ = 0;
-  let displacementZ = 0;
-  let maxDisplacement = 0;
-  let minDisplacement = 0;
-  let lastPitch = 0;
-  let lastWaveTime = Date.now();
-  let peakSlam = 0;
-  let slamTimer = 0;
-  let isMicro = false;       // RaceBox Micro reports input voltage instead of battery %
-
-  // Dynamic config options inside the Signal K Admin UI
-  plugin.schema = {
+const pluginMetadata = {
+  id: 'signalk-racebox-imu',
+  name: 'RaceBox BLE Telemetry',
+  description: 'Streams 25Hz GNSS and 6-Axis IMU data from RaceBox Mini/Micro directly into Signal K',
+  schema: {
     type: 'object',
     properties: {
       zeroImuNow: {
@@ -87,47 +50,82 @@ module.exports = function (app) {
         }
       }
     }
-  };
+  }
+};
+
+module.exports = function (app) {
+  const plugin = { ...pluginMetadata };
+
+  // Nordic UART Service mappings
+  const SERVICE_UUID = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
+  const TX_UUID      = '6e400003-b5a3-f393-e0a9-e50e24dcca9e';
+
+  // Timing configuration (ms)
+  const ADAPTER_TIMEOUT = 10000;
+  const SCAN_POLL_INTERVAL = 2000;
+  const CONNECT_TIMEOUT = 15000;
+  const GATT_TIMEOUT = 10000;
+  const RETRY_DELAY = 5000;
+  const WATCHDOG_INTERVAL = 5000;
+  const DATA_STALE_TIMEOUT = 15000;
+
+  // Runtime State
+  let rxBuffer = Buffer.alloc(0);
+  let calibrationRequested = false;
+  let activeOptions = {};
+  let dataPacketCount = 0;
+  let debug = false;
+  let running = false;
+  let sessionGeneration = 0;
+  let btContext = null;
+  let currentDevice = null;
+  let currentTxChar = null;
+  let lastDataTime = 0;
+  let isMicro = false;
+
+  // Wave detection pipeline state
+  const DT = 0.04;           // 25Hz sample rate
+  const LEAK = 0.98;         // High-pass filter leak factor for integration
+  let velocityZ = 0;
+  let displacementZ = 0;
+  let maxDisplacement = 0;
+  let minDisplacement = 0;
+  let lastPitch = 0;
+  let lastWaveTime = Date.now();
+  let peakSlam = 0;
+  let slamTimer = 0;
 
   plugin.start = function (options) {
+    if (!app) return; // Guard for non-Signal K test environments
+
     activeOptions = options || { offsets: { pitch: 0, roll: 0 } };
-    debug = activeOptions.debugLogging !== false; // Default to true
+    debug = activeOptions.debugLogging !== false;
 
     if (debug) {
       app.debug('[RaceBox] ========== PLUGIN START ==========');
-      app.debug('[RaceBox] Plugin starting with options:', JSON.stringify(activeOptions));
     }
 
-    // Remove leftover keys from older plugin versions so the saved config
-    // matches the current schema
+    // Cleanup stale keys from very old versions
     const staleKeys = ['enableIMU', 'triggerCalibration', 'triggerBleReset', 'calibrationOffsets'];
     const foundStale = staleKeys.filter((k) => k in activeOptions);
     if (foundStale.length > 0) {
       foundStale.forEach((k) => delete activeOptions[k]);
-      if (debug) app.debug('[RaceBox] Removed stale config keys:', foundStale.join(', '));
       app.savePluginOptions(activeOptions, (err) => {
-        if (err) app.error('[RaceBox] Failed to clean stale config keys:', err);
+        if (err && debug) app.error('[RaceBox] Failed to clean stale config keys:', err);
       });
     }
 
-    // Action 1: Restart the system Bluetooth service (BlueZ)
+    // Action: Reboot Bluetooth Stack
     if (activeOptions.rebootBluetoothStack) {
       app.setProviderStatus('RESET: Restarting Bluetooth service...');
-      if (debug) app.debug('[RaceBox] Bluetooth reset requested');
-
       activeOptions.rebootBluetoothStack = false;
-      app.savePluginOptions(activeOptions, (err) => {
-        if (err) app.error('[RaceBox] Failed to clear reset flag:', err);
-      });
+      app.savePluginOptions(activeOptions, () => {});
 
       exec('sudo systemctl restart bluetooth', (error) => {
         if (error) {
           app.error('[RaceBox] Bluetooth reset error:', error.message);
           app.setProviderStatus('RESET FAILED: ' + error.message);
-        } else {
-          if (debug) app.debug('[RaceBox] Bluetooth service restarted');
         }
-        // Continue with normal startup either way, after a settle delay
         setTimeout(() => {
           running = true;
           mainLoop().catch((e) => app.error('[RaceBox] Main loop crashed:', e.message));
@@ -136,30 +134,26 @@ module.exports = function (app) {
       return;
     }
 
-    // Action 2: Arm Calibration Flag
+    // Action: Arm Calibration
     if (activeOptions.zeroImuNow) {
       calibrationRequested = true;
-      app.setProviderStatus('CAL: Armed for calibration. Boat must be level and floating naturally.');
-      if (debug) app.debug('[RaceBox] Calibration mode armed');
-
+      app.setProviderStatus('CAL: Armed for calibration. Boat must be level.');
       activeOptions.zeroImuNow = false;
       dataPacketCount = 0;
-
-      app.savePluginOptions(activeOptions, (err) => {
-        if (err) app.error('[RaceBox] Failed to clear calibration flag:', err);
-      });
+      app.savePluginOptions(activeOptions, () => {});
     }
 
     running = true;
-    mainLoop().catch((e) => app.error('[RaceBox] Main loop crashed:', e.message));
+    mainLoop().catch((e) => {
+      if (app) app.error('[RaceBox] Main loop crashed:', e.message);
+    });
   };
 
   plugin.stop = function () {
-    app.setProviderStatus('Stopped');
-    if (debug) app.debug('[RaceBox] ========== PLUGIN STOP ==========');
+    if (app) app.setProviderStatus('Stopped');
     running = false;
-    sessionGeneration++; // invalidate in-flight session callbacks
-    cleanupSession('plugin stop'); // fire-and-forget async teardown
+    sessionGeneration++;
+    cleanupSession('plugin stop');
   };
 
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -172,7 +166,6 @@ module.exports = function (app) {
     return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
   }
 
-  // --- Main reconnect loop: one BLE session at a time, retry on failure ---
   async function mainLoop() {
     while (running) {
       const gen = ++sessionGeneration;
@@ -180,8 +173,7 @@ module.exports = function (app) {
         await runSession(gen);
       } catch (err) {
         if (!running) break;
-        app.setProviderStatus(`${err.message}. Retrying in ${RETRY_DELAY / 1000}s...`);
-        if (debug) app.debug('[RaceBox] Session ended:', err.message);
+        if (app) app.setProviderStatus(`${err.message}. Retrying in ${RETRY_DELAY / 1000}s...`);
       }
       await cleanupSession('session end');
       if (!running) break;
@@ -190,21 +182,20 @@ module.exports = function (app) {
   }
 
   async function runSession(gen) {
-    app.setProviderStatus('Initializing Bluetooth (BlueZ/D-Bus)...');
+    if (!app) return;
+    app.setProviderStatus('Initializing Bluetooth...');
+    
     btContext = createBluetooth();
     const adapter = await withTimeout(btContext.bluetooth.defaultAdapter(), ADAPTER_TIMEOUT, 'Bluetooth adapter init');
 
     if (!(await adapter.isPowered().catch(() => false))) {
-      throw new Error('Bluetooth adapter is powered off (try: bluetoothctl power on)');
+      throw new Error('Bluetooth adapter is powered off');
     }
 
-    // Scan and poll BlueZ's device list for a RaceBox by name
     app.setProviderStatus('Scanning for RaceBox hardware...');
     try {
       if (!(await adapter.isDiscovering())) await adapter.startDiscovery();
-    } catch (e) {
-      if (debug) app.debug('[RaceBox] startDiscovery:', e.message);
-    }
+    } catch (e) {}
 
     let device = null;
     let deviceName = null;
@@ -214,36 +205,24 @@ module.exports = function (app) {
         try {
           const candidate = await adapter.getDevice(mac);
           const name = await withTimeout(candidate.getName(), 3000, 'getName').catch(() => null);
-          if (debug && name) app.debug('[RaceBox] Discovered device:', name);
           if (name && name.startsWith('RaceBox')) {
             device = candidate;
             deviceName = name;
             break;
           }
-        } catch (e) {
-          // device disappeared from BlueZ cache - ignore
-        }
+        } catch (e) {}
       }
       if (!device) await sleep(SCAN_POLL_INTERVAL);
     }
-    if (!device) return; // stopped while scanning
+    if (!device) return;
 
     currentDevice = device;
-    // RaceBox Micro has no battery - byte 67 of the data message carries
-    // input voltage x10 instead of a charge level (protocol rev 8)
     isMicro = deviceName.startsWith('RaceBox Micro');
     app.setProviderStatus(`Found ${deviceName}! Connecting...`);
-    if (debug) app.debug(`[RaceBox] Connecting to: ${deviceName}${isMicro ? ' (Micro - input voltage mode)' : ''}`);
 
-    try {
-      await adapter.stopDiscovery();
-    } catch (e) {
-      if (debug) app.debug('[RaceBox] stopDiscovery:', e.message);
-    }
-
+    try { await adapter.stopDiscovery(); } catch (e) {}
     await withTimeout(device.connect(), CONNECT_TIMEOUT, 'Connection');
 
-    app.setProviderStatus('Connected. Discovering GATT services...');
     const gatt = await withTimeout(device.gatt(), GATT_TIMEOUT, 'GATT discovery');
     const service = await withTimeout(gatt.getPrimaryService(SERVICE_UUID), GATT_TIMEOUT, 'UART service lookup');
     const txChar = await withTimeout(service.getCharacteristic(TX_UUID), GATT_TIMEOUT, 'TX characteristic lookup');
@@ -254,35 +233,24 @@ module.exports = function (app) {
     lastDataTime = Date.now();
 
     txChar.on('valuechanged', (buf) => {
-      if (gen !== sessionGeneration) return; // stale session
+      if (gen !== sessionGeneration) return;
       lastDataTime = Date.now();
-      if (debug && dataPacketCount === 0) app.debug('[RaceBox] First notification received, length:', buf.length);
       processIncomingBytes(buf);
     });
 
-    app.setProviderStatus('Subscribing to 25Hz telemetry stream...');
+    app.setProviderStatus('Subscribing to telemetry...');
     await withTimeout(txChar.startNotifications(), GATT_TIMEOUT, 'Subscription');
+    app.setProviderStatus('Streaming live data.');
 
-    app.setProviderStatus('Streaming live data successfully into Signal K.');
-    if (debug) app.debug('[RaceBox] Subscribed to TX characteristic - streaming');
-
-    // Watchdog: hold the session open until stop, disconnect, or stale data
     while (running && gen === sessionGeneration) {
       await sleep(WATCHDOG_INTERVAL);
-      if (!running || gen !== sessionGeneration) break;
-
       const connected = await device.isConnected().catch(() => false);
       if (!connected) throw new Error('Device link severed');
-
-      if (Date.now() - lastDataTime > DATA_STALE_TIMEOUT) {
-        throw new Error('Data stream stalled');
-      }
+      if (Date.now() - lastDataTime > DATA_STALE_TIMEOUT) throw new Error('Data stream stalled');
     }
   }
 
   async function cleanupSession(reason) {
-    if (debug) app.debug('[RaceBox] cleanupSession:', reason);
-
     const txChar = currentTxChar;
     const device = currentDevice;
     const ctx = btContext;
@@ -293,139 +261,71 @@ module.exports = function (app) {
 
     if (txChar) {
       try { txChar.removeAllListeners('valuechanged'); } catch (e) {}
-      await withTimeout(txChar.stopNotifications(), 3000, 'stopNotifications').catch(() => {});
+      await txChar.stopNotifications().catch(() => {});
     }
-    if (device) {
-      await withTimeout(device.disconnect(), 5000, 'disconnect').catch(() => {});
-    }
-    if (ctx) {
-      try { ctx.destroy(); } catch (e) {}
-    }
+    if (device) await device.disconnect().catch(() => {});
+    if (ctx) try { ctx.destroy(); } catch (e) {}
   }
 
-  // --- Stream Buffer Re-assembly Pipeline ---
   function processIncomingBytes(chunk) {
     rxBuffer = Buffer.concat([rxBuffer, chunk]);
-
-    if (debug && dataPacketCount === 0) {
-      app.debug('[RaceBox] First chunk received, length:', chunk.length, 'buffer total:', rxBuffer.length);
-    }
-
     while (rxBuffer.length >= 6) {
       if (rxBuffer[0] !== 0xB5 || rxBuffer[1] !== 0x62) {
-        if (debug && dataPacketCount === 0) app.debug('[RaceBox] Invalid packet header, searching for sync...');
         rxBuffer = rxBuffer.slice(1);
         continue;
       }
-
-      const msgClass = rxBuffer.readUInt8(2);
-      const msgId = rxBuffer.readUInt8(3);
       const payloadLength = rxBuffer.readUInt16LE(4);
       const totalPacketLength = 6 + payloadLength + 2;
-
-      if (debug && dataPacketCount === 0) {
-        app.debug('[RaceBox] Found packet header, msgClass:', msgClass.toString(16), 'msgId:', msgId.toString(16), 'payloadLength:', payloadLength, 'totalLength:', totalPacketLength);
-      }
-
-      if (rxBuffer.length < totalPacketLength) {
-        break;
-      }
+      if (rxBuffer.length < totalPacketLength) break;
 
       const packet = rxBuffer.slice(0, totalPacketLength);
       const payload = packet.slice(6, 6 + payloadLength);
 
-      // Verify checksum integrity
       let ckA = 0, ckB = 0;
       for (let i = 2; i < totalPacketLength - 2; i++) {
         ckA = (ckA + packet[i]) & 0xFF;
         ckB = (ckB + ckA) & 0xFF;
       }
 
-      if (debug && dataPacketCount === 0) {
-        app.debug('[RaceBox] Checksum - calculated:', ckA.toString(16), ckB.toString(16), 'expected:', packet[totalPacketLength - 2].toString(16), packet[totalPacketLength - 1].toString(16));
-      }
-
       if (ckA === packet[totalPacketLength - 2] && ckB === packet[totalPacketLength - 1]) {
-        if (debug && dataPacketCount === 0) {
-          app.debug('[RaceBox] Checksum VALID');
-        }
-
+        const msgClass = rxBuffer.readUInt8(2);
+        const msgId = rxBuffer.readUInt8(3);
         if (msgClass === 0xFF && msgId === 0x01) {
-          if (debug && dataPacketCount === 0) app.debug('[RaceBox] Valid RaceBox packet! Parsing data...');
           parseRaceBoxData(payload);
-        } else {
-          if (debug && dataPacketCount === 0) {
-            app.debug('[RaceBox] Packet is not RaceBox telemetry (msgClass:', msgClass.toString(16), 'msgId:', msgId.toString(16), ')');
-          }
-        }
-      } else {
-        if (debug && dataPacketCount === 0) {
-          app.debug('[RaceBox] Checksum FAILED');
         }
       }
-
       rxBuffer = rxBuffer.slice(totalPacketLength);
     }
   }
 
-  // --- Core Binary Packet Parser ---
   function parseRaceBoxData(payload) {
-    if (payload.length < 80) {
-      if (debug) app.debug('[RaceBox] Payload too short:', payload.length);
-      return;
-    }
-
+    if (payload.length < 80) return;
     dataPacketCount++;
 
-    const values = [];
-
-    // 1. Raw 6-Axis IMU Sensor Channels
-    // GForce X/Y/Z: Int16 at offsets 68/70/72, in milli-g (divide by 1000 for g)
     const accelX = payload.readInt16LE(68) / 1000;
     const accelY = payload.readInt16LE(70) / 1000;
     const accelZ = payload.readInt16LE(72) / 1000;
-
-    // Rotation rate X/Y/Z: Int16 at offsets 74/76/78, in centi-deg/s (X=roll, Y=pitch, Z=yaw)
     const gyroX = (payload.readInt16LE(74) / 100) * (Math.PI / 180);
     const gyroY = (payload.readInt16LE(76) / 100) * (Math.PI / 180);
     const gyroZ = (payload.readInt16LE(78) / 100) * (Math.PI / 180);
 
-    if (debug && dataPacketCount === 1) {
-      app.debug('[RaceBox] Packet 1: accelX=', accelX, 'accelY=', accelY, 'accelZ=', accelZ);
-    }
-
-    // Calculate immediate derived Pitch/Roll orientation angles
     const calculatedRoll = Math.atan2(accelY, accelZ);
     const calculatedPitch = Math.atan2(-accelX, Math.sqrt(accelY * accelY + accelZ * accelZ));
 
-    // Live execution of boat level calibration request
     if (calibrationRequested) {
       calibrationRequested = false;
       activeOptions.offsets = { pitch: calculatedPitch, roll: calculatedRoll };
-
-      if (debug) {
-        app.debug(`[RaceBox] CAL CAPTURED at packet ${dataPacketCount}: Roll=${calculatedRoll.toFixed(4)} rad, Pitch=${calculatedPitch.toFixed(4)} rad`);
+      if (app) {
+        app.setProviderStatus('Calibration captured.');
+        app.savePluginOptions(activeOptions, () => {});
       }
-      app.setProviderStatus(`Calibration captured at packet ${dataPacketCount}. Offsets applied.`);
-
-      setTimeout(() => {
-        app.savePluginOptions(activeOptions, (err) => {
-          if (err) {
-            app.error('[RaceBox] Failed to persist calibration offsets:', err);
-          } else {
-            if (debug) app.debug('[RaceBox] Calibration offsets persisted to config.');
-          }
-        });
-      }, 0);
     }
 
-    // Apply baseline alignment offsets
     const currentOffsets = activeOptions.offsets || { pitch: 0, roll: 0 };
     const finalRoll = calculatedRoll - currentOffsets.roll;
     const finalPitch = calculatedPitch - currentOffsets.pitch;
 
-    // Push 6 IMU metrics and calculated values to standard paths
-    values.push(
+    const values = [
       { path: 'navigation.attitude.roll', value: finalRoll },
       { path: 'navigation.attitude.pitch', value: finalPitch },
       { path: 'navigation.rateOfTurn', value: gyroZ },
@@ -435,56 +335,47 @@ module.exports = function (app) {
       { path: 'navigation.gyro.x', value: gyroX },
       { path: 'navigation.gyro.y', value: gyroY },
       { path: 'navigation.gyro.z', value: gyroZ }
-    );
+    ];
 
-    \/\/ 1.5 Experimental Wave & Slam Detection
     if (activeOptions.enableWaveDetection) {
-      \/\/ Rotate to Earth-fixed vertical frame (True Z)
-      \/\/ Formula: az_earth = -ax*sin(P) + ay*sin(R)*cos(P) + az*cos(R)*cos(P)
       const sinP = Math.sin(finalPitch);
       const cosP = Math.cos(finalPitch);
       const sinR = Math.sin(finalRoll);
       const cosR = Math.cos(finalRoll);
 
       const trueZ = -accelX * sinP + accelY * sinR * cosP + accelZ * cosR * cosP;
-      const dynamicZ = (trueZ - 1.0) * 9.81; \/\/ Convert G to m\/s^2 and remove gravity
+      const dynamicZ = (trueZ - 1.0) * 9.81;
 
       values.push({ path: 'navigation.accel.trueZ', value: trueZ });
 
-      \/\/ Leaky integration for velocity and displacement
       velocityZ = (velocityZ + dynamicZ * DT) * LEAK;
       displacementZ = (displacementZ + velocityZ * DT) * LEAK;
 
-      \/\/ Track min\/max displacement for wave height within the pitch cycle
       if (displacementZ > maxDisplacement) maxDisplacement = displacementZ;
       if (displacementZ < minDisplacement) minDisplacement = displacementZ;
 
-      \/\/ Detect wave cycle via Pitch zero-crossing (inflection points of the wave)
       if ((lastPitch >= 0 && finalPitch < 0) || (lastPitch <= 0 && finalPitch > 0)) {
         const waveHeight = maxDisplacement - minDisplacement;
         const now = Date.now();
-        const halfPeriod = (now - lastWaveTime) \/ 1000;
+        const halfPeriod = (now - lastWaveTime) / 1000;
 
-        if (waveHeight > 0.05 && halfPeriod > 0.2) { \/\/ Noise filters
+        if (waveHeight > 0.05 && halfPeriod > 0.2) {
           values.push(
             { path: 'environment.wind.waveHeight', value: waveHeight },
             { path: 'environment.wind.wavePeriod', value: halfPeriod * 2 }
           );
         }
-
-        \/\/ Reset for next half-cycle
         maxDisplacement = displacementZ;
         minDisplacement = displacementZ;
         lastWaveTime = now;
       }
       lastPitch = finalPitch;
 
-      \/\/ Hull Slam Detection (Peak-hold for 1 second)
       const slamLimit = activeOptions.slamThreshold || 0.5;
       const currentSlam = Math.abs(trueZ - 1.0);
       if (currentSlam > slamLimit) {
         if (currentSlam > peakSlam) peakSlam = currentSlam;
-        slamTimer = 25; \/\/ Hold for 25 samples @ 25Hz
+        slamTimer = 25;
       }
 
       if (slamTimer > 0) {
@@ -494,83 +385,44 @@ module.exports = function (app) {
       }
     }
 
-    // 2. Read System State Metrics
-    // Byte 67 is model-dependent (protocol rev 8):
-    // - Micro: input voltage x10 (e.g. 0x79 = 121 = 12.1V) - it has no battery
-    // - Mini/MiniS: bit 7 = charging flag, bits 0-6 = battery level in percent
     const batteryByte = payload.readUInt8(67);
-
     if (isMicro) {
-      values.push({
-        path: 'electrical.batteries.racebox.voltage',
-        value: batteryByte / 10
-      });
+      values.push({ path: 'electrical.batteries.racebox.voltage', value: batteryByte / 10 });
     } else {
-      const isCharging = (batteryByte & 0x80) !== 0;
-      const batteryPercent = batteryByte & 0x7F;
       values.push(
-        {
-          path: 'electrical.batteries.racebox.capacity.stateOfCharge',
-          value: batteryPercent / 100
-        },
-        {
-          path: 'electrical.batteries.racebox.chargingMode',
-          value: isCharging ? 'charging' : 'not charging'
-        }
+        { path: 'electrical.batteries.racebox.capacity.stateOfCharge', value: (batteryByte & 0x7F) / 100 },
+        { path: 'electrical.batteries.racebox.chargingMode', value: (batteryByte & 0x80) ? 'charging' : 'not charging' }
       );
     }
 
-    // 3. High-Performance GNSS Engine Extraction
-    const fixStatus = payload.readUInt8(20);       // 0 = no fix, 2 = 2D, 3 = 3D
-    const fixStatusFlags = payload.readUInt8(21);  // bit 0 = valid fix
-    const satellitesConnected = payload.readUInt8(23);
-    const horizontalAccuracyM = payload.readUInt32LE(40) / 1000; // mm -> m
-    const pdop = payload.readUInt16LE(64) / 100;
-
+    const fixStatus = payload.readUInt8(20);
+    const fixStatusFlags = payload.readUInt8(21);
     values.push(
-      { path: 'navigation.gnss.satellites', value: satellitesConnected },
-      { path: 'navigation.gnss.horizontalDilution', value: pdop },
-      { path: 'navigation.gnss.positionError', value: horizontalAccuracyM }
+      { path: 'navigation.gnss.satellites', value: payload.readUInt8(23) },
+      { path: 'navigation.gnss.horizontalDilution', value: payload.readUInt16LE(64) / 100 },
+      { path: 'navigation.gnss.positionError', value: payload.readUInt32LE(40) / 1000 }
     );
 
-    // Only broadcast tracking and position vectors if a live, valid 2D/3D fix exists
     if (fixStatus >= 2 && (fixStatusFlags & 0x01)) {
-      const lon = payload.readInt32LE(24) / 10000000;
-      const lat = payload.readInt32LE(28) / 10000000;
-
-      const speedMms = payload.readInt32LE(48); // mm/s
-      const speedMs = speedMms / 1000;
-
-      const headingDegreesScaled = payload.readInt32LE(52); // degrees x 100000
-      const headingRad = (headingDegreesScaled / 100000) * (Math.PI / 180);
-
       values.push(
-        { path: 'navigation.position', value: { latitude: lat, longitude: lon } },
-        { path: 'navigation.speedOverGround', value: speedMs },
-        { path: 'navigation.courseOverGroundTrue', value: headingRad },
+        { path: 'navigation.position', value: { latitude: payload.readInt32LE(28) / 10000000, longitude: payload.readInt32LE(24) / 10000000 } },
+        { path: 'navigation.speedOverGround', value: payload.readInt32LE(48) / 1000 },
+        { path: 'navigation.courseOverGroundTrue', value: (payload.readInt32LE(52) / 100000) * (Math.PI / 180) },
         { path: 'navigation.gnss.type', value: 'GPS+GLONASS+GALILEO' }
       );
     }
 
-    // Deliver unified delta packet to Signal K Data Broker
-    if (debug && dataPacketCount === 1) {
-      app.debug('[RaceBox] Sending first delta to Signal K with', values.length, 'values');
-    }
-
-    app.handleMessage(plugin.id, {
-      updates: [
-        {
-          source: { label: plugin.id },
-          timestamp: new Date().toISOString(),
-          values: values
-        }
-      ]
-    });
-
-    if (debug && (dataPacketCount % 250 === 0)) {
-      app.debug(`[RaceBox] Received ${dataPacketCount} data packets, last roll=${finalRoll.toFixed(4)}`);
+    if (app) {
+      app.handleMessage(plugin.id, {
+        updates: [{ source: { label: plugin.id }, timestamp: new Date().toISOString(), values }]
+      });
     }
   }
 
   return plugin;
+};
+
+// Export for internal unit testing (bypass hardware requirement)
+module.exports._testable = {
+  createPlugin: (app) => module.exports(app)
 };

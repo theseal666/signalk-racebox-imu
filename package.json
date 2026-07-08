@@ -4,10 +4,17 @@
   "description": "Auto-discovers and connects to a RaceBox Mini or Micro over BLE, sending high-precision IMU, GNSS, and calculated wave data to Signal K.",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "mocha test/*.js"
   },
   "keywords": [
-    "signalk-node-server-plugin"
+    "signalk-node-server-plugin",
+    "racebox",
+    "imu",
+    "bluetooth",
+    "ble",
+    "waves",
+    "telemetry",
+    "navigation"
   ],
   "author": "theseal666",
   "license": "MIT",
@@ -24,6 +31,10 @@
   },
   "engines": {
     "node": ">=18.0.0"
+  },
+  "devDependencies": {
+    "mocha": "^10.0.0",
+    "chai": "^4.3.0"
   },
   "signalK": {
     "main": "index.js"
