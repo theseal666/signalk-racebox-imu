@@ -47,9 +47,11 @@ Estimating wave height from acceleration requires double-integration. This plugi
 * **Logic:** The boat's Pitch cycle identifies wave start/peak/end. We integrate vertical acceleration to velocity, then displacement. Wave height is the peak-to-peak displacement within each pitch-detected half-cycle.
 * **Persistence:** Metrics are reported at 25Hz and auto-reset to `0` after 20s of inactivity.
 
-### 3. Hull Slam Detection
-* **Path:** `performance.hull.slamAcceleration` (g)
-* **Logic:** Monitors `True Z` for impacts exceeding the configurable threshold. Uses a 1-second peak-hold to ensure the event is captured in logs.
+### 3. Complex Slam Detection
+* **Path:** `performance.hull.slamAcceleration` (g), `performance.hull.slamAngularJolt` (rad/s²)
+* **Logic:** Instead of just vertical motion, the plugin now monitors the **3D G-Force Resultant** vector. This captures impacts from the side (beam seas), bow-on slams, or sudden decelerations.
+* **Angular Jolt:** Captures sudden, violent changes in the boat's rotation rates (Pitch/Roll/Yaw), which often accompany a significant hull slam.
+* **Persistence:** Slams use a 1-second peak-hold to ensure they are registered in logs.
 
 ---
 

@@ -89,6 +89,7 @@ module.exports = function (app) {
   let minDisplacement = 0;
   let lastPitch = 0;
   let lastWaveTime = Date.now();
+  let lastGyro = { x: 0, y: 0, z: 0 };
   let peakSlam = 0;
   let slamTimer = 0;
 
@@ -377,11 +378,29 @@ module.exports = function (app) {
         currentWavePeriod = 0;
       }
 
+      // Complex Slam Detection (Multi-vector impact analysis)
       const slamLimit = activeOptions.slamThreshold || 0.5;
-      const currentSlam = Math.abs(trueZ - 1.0);
+      
+      // 1. G-Force Resultant (Impacts from any direction)
+      const gResultant = Math.sqrt(accelX * accelX + accelY * accelY + accelZ * accelZ);
+      const gImpact = Math.abs(gResultant - 1.0); // Deviation from 1G baseline
+
+      // 2. Angular Jolt (Sudden changes in rotation rates)
+      const gyroJolt = Math.sqrt(
+        Math.pow(gyroX - lastGyro.x, 2) +
+        Math.pow(gyroY - lastGyro.y, 2) +
+        Math.pow(gyroZ - lastGyro.z, 2)
+      ) / DT;
+
+      // Update last gyro state
+      lastGyro = { x: gyroX, y: gyroY, z: gyroZ };
+
+      // Unified Slam Metric (Focus on G-Force impact, but could be weighted)
+      const currentSlam = gImpact; 
+
       if (currentSlam > slamLimit) {
         if (currentSlam > peakSlam) peakSlam = currentSlam;
-        slamTimer = 25;
+        slamTimer = 25; // Hold peak for 1 second @ 25Hz
       }
 
       if (slamTimer > 0) {
@@ -394,7 +413,8 @@ module.exports = function (app) {
         { path: 'navigation.accel.trueZ', value: trueZ },
         { path: 'environment.wind.waveHeight', value: currentWaveHeight },
         { path: 'environment.wind.wavePeriod', value: currentWavePeriod },
-        { path: 'performance.hull.slamAcceleration', value: peakSlam }
+        { path: 'performance.hull.slamAcceleration', value: peakSlam },
+        { path: 'performance.hull.slamAngularJolt', value: gyroJolt }
       );
     }
 
