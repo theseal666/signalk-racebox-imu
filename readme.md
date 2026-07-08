@@ -1,7 +1,7 @@
 # signalk-racebox-imu
 
 <p align="center">
-  <img src="SignalK-RaceBox-IMU-plugin_logo.png" alt="Signal K RaceBox IMU plugin logo" width="300">
+  <img src="images/logo.png" alt="Signal K RaceBox IMU plugin logo" width="300">
 </p>
 
 A Signal K plugin to auto-discover, connect, and stream telemetry from a **RaceBox Mini**, **RaceBox Mini S**, or **RaceBox Micro** over Bluetooth Low Energy (BLE).
@@ -19,6 +19,19 @@ This plugin parses the RaceBox binary protocol (UBX-framed, per the official *Ra
 * **In-App Calibration:** Zero out Pitch & Roll offsets while the boat is level.
 * **Self-Healing Connection:** Automatic reconnect with backoff and data-staleness watchdog.
 * **High-Quality Codebase:** Decoupled metadata and automated unit tests for reliability.
+
+---
+
+## Screenshots
+
+### Plugin Configuration & Experimental Settings
+![Plugin Settings](images/settings.png)
+
+### Live Data Stream (25Hz)
+![Data Browser](images/data-browser.png)
+
+### Connection Status
+![Connection Status](images/status.png)
 
 ---
 
