@@ -1,6 +1,6 @@
 {
   "name": "signalk-racebox-imu",
-  "version": "1.1.1",
+  "version": "1.2.0",
   "description": "Auto-discovers and connects to a RaceBox Mini or Micro over BLE, sending high-precision IMU, GNSS, and calculated wave data to Signal K.",
   "main": "index.js",
   "scripts": {
@@ -13,8 +13,11 @@
     "bluetooth",
     "ble",
     "waves",
+    "wave-height",
+    "hull-slam",
     "telemetry",
-    "navigation"
+    "navigation",
+    "expedition"
   ],
   "author": "theseal666",
   "license": "MIT",
