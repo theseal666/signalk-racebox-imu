@@ -193,6 +193,22 @@ module.exports = function (app) {
     }
 
     app.setProviderStatus('Scanning for RaceBox hardware...');
+
+    // Send metadata for experimental paths
+    if (activeOptions.enableWaveDetection) {
+      app.handleMessage(plugin.id, {
+        updates: [{
+          meta: [
+            { path: 'navigation.accel.trueZ', value: { units: 'm/s2' } },
+            { path: 'environment.wind.waveHeight', value: { units: 'm' } },
+            { path: 'environment.wind.wavePeriod', value: { units: 's' } },
+            { path: 'performance.hull.slamAcceleration', value: { units: 'm/s2' } },
+            { path: 'performance.hull.slamAngularJolt', value: { units: 'rad/s2' } }
+          ]
+        }]
+      });
+    }
+
     try {
       if (!(await adapter.isDiscovering())) await adapter.startDiscovery();
     } catch (e) {}
@@ -347,7 +363,8 @@ module.exports = function (app) {
       const cosR = Math.cos(finalRoll);
 
       const trueZ = -accelX * sinP + accelY * sinR * cosP + accelZ * cosR * cosP;
-      const dynamicZ = (trueZ - 1.0) * 9.81;
+      const trueZMS2 = trueZ * 9.80665; // Earth-fixed vertical in m/s2
+      const dynamicZ = (trueZ - 1.0) * 9.80665; // Dynamic vertical in m/s2
 
       velocityZ = (velocityZ + dynamicZ * DT) * LEAK;
       displacementZ = (displacementZ + velocityZ * DT) * LEAK;
@@ -395,10 +412,10 @@ module.exports = function (app) {
       // Update last gyro state
       lastGyro = { x: gyroX, y: gyroY, z: gyroZ };
 
-      // Unified Slam Metric (Focus on G-Force impact, but could be weighted)
-      const currentSlam = gImpact; 
+      // Unified Slam Metric (Converted to SI: m/s2)
+      const currentSlam = gImpact * 9.80665; 
 
-      if (currentSlam > slamLimit) {
+      if (currentSlam > (slamLimit * 9.80665)) {
         if (currentSlam > peakSlam) peakSlam = currentSlam;
         slamTimer = 25; // Hold peak for 1 second @ 25Hz
       }
@@ -410,7 +427,7 @@ module.exports = function (app) {
 
       // Persistent reporting: Always include these in the 25Hz delta
       values.push(
-        { path: 'navigation.accel.trueZ', value: trueZ },
+        { path: 'navigation.accel.trueZ', value: trueZMS2 },
         { path: 'environment.wind.waveHeight', value: currentWaveHeight },
         { path: 'environment.wind.wavePeriod', value: currentWavePeriod },
         { path: 'performance.hull.slamAcceleration', value: peakSlam },

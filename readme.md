@@ -30,7 +30,7 @@ Bluetooth connectivity is handled by [`node-ble`](https://github.com/chrvadala/n
 ![Plugin Settings](https://raw.githubusercontent.com/theseal666/signalk-racebox-imu/main/images/data-browser.png)
 
 ### Live Data Stream (25Hz)
-![Data Browser](https://raw.githubusercontent.com/theseal666/signalk-racebox-imu/main/images/settings.png)
+![Data Browser](https://raw.githubusercontent.com/theseal666/signalk-racebox-imu/main/main/images/settings.png)
 
 ### Connection Status
 ![Connection Status](https://raw.githubusercontent.com/theseal666/signalk-racebox-imu/main/images/status.png)
@@ -43,7 +43,7 @@ This plugin performs real-time processing of the 25Hz IMU stream to derive advan
 
 ### 1. True Vertical Acceleration (True Z)
 To isolate actual vertical motion from the boat's rotation, the plugin performs a 3D rotation of the raw accelerometer data into an Earth-fixed frame using the current Pitch and Roll.
-* **Path:** `navigation.accel.trueZ` (g)
+* **Path:** `navigation.accel.trueZ` (m/s²)
 * **Math:** $a_z^{earth} = -a_x \sin(P) + a_y \sin(R)\cos(P) + a_z \cos(R)\cos(P)$
 
 ### 2. Wave Height & Period
@@ -53,7 +53,7 @@ Estimating wave height from acceleration requires double-integration. This plugi
 * **Persistence:** Metrics are reported at 25Hz and auto-reset to `0` after 20s of inactivity to ensure clean logging.
 
 ### 3. Complex Slam Detection
-* **Path:** `performance.hull.slamAcceleration` (g), `performance.hull.slamAngularJolt` (rad/s²)
+* **Path:** `performance.hull.slamAcceleration` (m/s²), `performance.hull.slamAngularJolt` (rad/s²)
 * **Logic:** Monitors the **3D G-Force Resultant** magnitude. This captures impacts from any direction (side hits, bow-on slams, or falling off waves).
 * **Angular Jolt:** Measures the derivative of angular rates to capture sudden, violent orientation changes.
 * **Persistence:** Uses a 1-second peak-hold to ensure events are captured in logs.
@@ -123,9 +123,9 @@ npm test
 * `navigation.gnss.{satellites, horizontalDilution, positionError}`
 
 ### Experimental (Enabled in Config)
-* `navigation.accel.trueZ` (g)
+* `navigation.accel.trueZ` (m/s²)
 * `environment.wind.waveHeight` (m), `environment.wind.wavePeriod` (s)
-* `performance.hull.slamAcceleration` (g), `performance.hull.slamAngularJolt` (rad/s²)
+* `performance.hull.slamAcceleration` (m/s²), `performance.hull.slamAngularJolt` (rad/s²)
 
 ### Electrical
 * `electrical.batteries.racebox.capacity.stateOfCharge` (0 to 1)
