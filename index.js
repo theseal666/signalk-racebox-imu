@@ -3,10 +3,6 @@ const { exec } = require('child_process');
 
 /**
  * Signal K Plugin: RaceBox BLE Telemetry
- * 
- * This plugin decouples metadata from the runtime factory function to ensure 
- * the Signal K Appstore can always load it, even if system dependencies (D-Bus)
- * are missing or hardware is not present.
  */
 
 const pluginMetadata = {
@@ -68,6 +64,7 @@ module.exports = function (app) {
   const RETRY_DELAY = 5000;
   const WATCHDOG_INTERVAL = 5000;
   const DATA_STALE_TIMEOUT = 15000;
+  const RESTART_SETTLE_DELAY = 2000; // Time to wait for old process to release BLE
 
   // Runtime State
   let rxBuffer = Buffer.alloc(0);
@@ -96,7 +93,7 @@ module.exports = function (app) {
   let slamTimer = 0;
 
   plugin.start = function (options) {
-    if (!app) return; // Guard for non-Signal K test environments
+    if (!app) return;
 
     activeOptions = options || { offsets: { pitch: 0, roll: 0 } };
     debug = activeOptions.debugLogging !== false;
@@ -129,7 +126,7 @@ module.exports = function (app) {
         setTimeout(() => {
           running = true;
           mainLoop().catch((e) => app.error('[RaceBox] Main loop crashed:', e.message));
-        }, 2000);
+        }, RESTART_SETTLE_DELAY);
       });
       return;
     }
@@ -140,20 +137,25 @@ module.exports = function (app) {
       app.setProviderStatus('CAL: Armed for calibration. Boat must be level.');
       activeOptions.zeroImuNow = false;
       dataPacketCount = 0;
-      app.savePluginOptions(activeOptions, () => {});
+      // We don't save here to avoid an immediate restart storm; 
+      // the flag will be cleared in the next successful offset save.
     }
 
-    running = true;
-    mainLoop().catch((e) => {
-      if (app) app.error('[RaceBox] Main loop crashed:', e.message);
-    });
+    // Small delay to ensure any previous zombie instance has released the BLE adapter
+    setTimeout(() => {
+      running = true;
+      mainLoop().catch((e) => {
+        if (app) app.error('[RaceBox] Main loop crashed:', e.message);
+      });
+    }, 1000);
   };
 
   plugin.stop = function () {
     if (app) app.setProviderStatus('Stopped');
     running = false;
     sessionGeneration++;
-    cleanupSession('plugin stop');
+    // cleanupSession is async but SignalK stop is sync.
+    // The mainLoop and runSession watchdog will break and call cleanup.
   };
 
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -240,7 +242,10 @@ module.exports = function (app) {
 
     app.setProviderStatus('Subscribing to telemetry...');
     await withTimeout(txChar.startNotifications(), GATT_TIMEOUT, 'Subscription');
-    app.setProviderStatus('Streaming live data.');
+    
+    if (running && gen === sessionGeneration) {
+      app.setProviderStatus('Streaming live data.');
+    }
 
     while (running && gen === sessionGeneration) {
       await sleep(WATCHDOG_INTERVAL);
@@ -316,7 +321,9 @@ module.exports = function (app) {
       calibrationRequested = false;
       activeOptions.offsets = { pitch: calculatedPitch, roll: calculatedRoll };
       if (app) {
-        app.setProviderStatus('Calibration captured.');
+        app.setProviderStatus('Calibration captured and applied.');
+        // We save the offsets and the cleared zeroImuNow flag in one go.
+        // This will trigger one final restart to ensure a clean state.
         app.savePluginOptions(activeOptions, () => {});
       }
     }
@@ -422,7 +429,6 @@ module.exports = function (app) {
   return plugin;
 };
 
-// Export for internal unit testing (bypass hardware requirement)
 module.exports._testable = {
   createPlugin: (app) => module.exports(app)
 };
