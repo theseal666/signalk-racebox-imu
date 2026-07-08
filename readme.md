@@ -116,20 +116,25 @@ At up to 25Hz:
 ### Navigation – Raw IMU (6-Axis)
 * `navigation.accel.x` — Accelerometer X (front/back, g)
 * `navigation.accel.y` — Accelerometer Y (right/left, g)
-* `navigation.accel.z` — Accelerometer Z (up/down, g)
+* `navigation.accel.z` — Accelerometer Z (up/down, g) — useful for heave/wave analysis
 * `navigation.gyro.x` — Gyroscope X (roll rate, rad/s)
 * `navigation.gyro.y` — Gyroscope Y (pitch rate, rad/s)
+* `navigation.gyro.z` — Gyroscope Z (yaw rate, rad/s)
 
 ### Navigation – GNSS/GPS Quality
 * `navigation.gnss.satellites` — Number of space vehicles used in the solution
 * `navigation.gnss.horizontalDilution` — PDOP (dimensionless)
 * `navigation.gnss.positionError` — Horizontal accuracy estimate (meters)
 
-### Electrical – Battery
+### Electrical – Power (model-dependent)
+The plugin detects the device model from its advertised name and publishes the correct interpretation:
+
+**RaceBox Mini / Mini S** (battery-powered):
 * `electrical.batteries.racebox.capacity.stateOfCharge` — Battery level (0 to 1)
 * `electrical.batteries.racebox.chargingMode` — `charging` / `not charging`
 
-> **RaceBox Micro note:** The Micro has no battery — the underlying protocol byte reports input voltage instead. The stateOfCharge value is not meaningful on a Micro.
+**RaceBox Micro** (externally powered, no battery):
+* `electrical.batteries.racebox.voltage` — Input voltage (Volts, 0.1V resolution)
 
 ---
 

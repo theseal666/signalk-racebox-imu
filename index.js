@@ -35,6 +35,7 @@ module.exports = function (app) {
   let currentDevice = null;
   let currentTxChar = null;
   let lastDataTime = 0;
+  let isMicro = false;       // RaceBox Micro reports input voltage instead of battery %
 
   // Dynamic config options inside the Signal K Admin UI
   plugin.schema = {
@@ -73,6 +74,18 @@ module.exports = function (app) {
     if (debug) {
       app.debug('[RaceBox] ========== PLUGIN START ==========');
       app.debug('[RaceBox] Plugin starting with options:', JSON.stringify(activeOptions));
+    }
+
+    // Remove leftover keys from older plugin versions so the saved config
+    // matches the current schema
+    const staleKeys = ['enableIMU', 'triggerCalibration', 'triggerBleReset', 'calibrationOffsets'];
+    const foundStale = staleKeys.filter((k) => k in activeOptions);
+    if (foundStale.length > 0) {
+      foundStale.forEach((k) => delete activeOptions[k]);
+      if (debug) app.debug('[RaceBox] Removed stale config keys:', foundStale.join(', '));
+      app.savePluginOptions(activeOptions, (err) => {
+        if (err) app.error('[RaceBox] Failed to clean stale config keys:', err);
+      });
     }
 
     // Action 1: Restart the system Bluetooth service (BlueZ)
@@ -194,8 +207,11 @@ module.exports = function (app) {
     if (!device) return; // stopped while scanning
 
     currentDevice = device;
+    // RaceBox Micro has no battery - byte 67 of the data message carries
+    // input voltage x10 instead of a charge level (protocol rev 8)
+    isMicro = deviceName.startsWith('RaceBox Micro');
     app.setProviderStatus(`Found ${deviceName}! Connecting...`);
-    if (debug) app.debug(`[RaceBox] Connecting to: ${deviceName}`);
+    if (debug) app.debug(`[RaceBox] Connecting to: ${deviceName}${isMicro ? ' (Micro - input voltage mode)' : ''}`);
 
     try {
       await adapter.stopDiscovery();
@@ -395,26 +411,35 @@ module.exports = function (app) {
       { path: 'navigation.accel.y', value: accelY },
       { path: 'navigation.accel.z', value: accelZ },
       { path: 'navigation.gyro.x', value: gyroX },
-      { path: 'navigation.gyro.y', value: gyroY }
+      { path: 'navigation.gyro.y', value: gyroY },
+      { path: 'navigation.gyro.z', value: gyroZ }
     );
 
     // 2. Read System State Metrics
-    // Byte 67: for Mini/MiniS, bit 7 = charging flag, bits 0-6 = battery level in percent.
-    // (For RaceBox Micro this byte is input voltage x10 instead - no battery.)
+    // Byte 67 is model-dependent (protocol rev 8):
+    // - Micro: input voltage x10 (e.g. 0x79 = 121 = 12.1V) - it has no battery
+    // - Mini/MiniS: bit 7 = charging flag, bits 0-6 = battery level in percent
     const batteryByte = payload.readUInt8(67);
-    const isCharging = (batteryByte & 0x80) !== 0;
-    const batteryPercent = batteryByte & 0x7F;
 
-    values.push(
-      {
-        path: 'electrical.batteries.racebox.capacity.stateOfCharge',
-        value: batteryPercent / 100
-      },
-      {
-        path: 'electrical.batteries.racebox.chargingMode',
-        value: isCharging ? 'charging' : 'not charging'
-      }
-    );
+    if (isMicro) {
+      values.push({
+        path: 'electrical.batteries.racebox.voltage',
+        value: batteryByte / 10
+      });
+    } else {
+      const isCharging = (batteryByte & 0x80) !== 0;
+      const batteryPercent = batteryByte & 0x7F;
+      values.push(
+        {
+          path: 'electrical.batteries.racebox.capacity.stateOfCharge',
+          value: batteryPercent / 100
+        },
+        {
+          path: 'electrical.batteries.racebox.chargingMode',
+          value: isCharging ? 'charging' : 'not charging'
+        }
+      );
+    }
 
     // 3. High-Performance GNSS Engine Extraction
     const fixStatus = payload.readUInt8(20);       // 0 = no fix, 2 = 2D, 3 = 3D
