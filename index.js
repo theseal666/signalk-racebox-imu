@@ -64,7 +64,7 @@ module.exports = function (app) {
   const RETRY_DELAY = 5000;
   const WATCHDOG_INTERVAL = 5000;
   const DATA_STALE_TIMEOUT = 15000;
-  const RESTART_SETTLE_DELAY = 2000; // Time to wait for old process to release BLE
+  const RESTART_SETTLE_DELAY = 2000;
 
   // Runtime State
   let rxBuffer = Buffer.alloc(0);
@@ -89,9 +89,13 @@ module.exports = function (app) {
   let minDisplacement = 0;
   let lastPitch = 0;
   let lastWaveTime = Date.now();
-  let waveMetricsReported = false;
   let peakSlam = 0;
   let slamTimer = 0;
+
+  // Persistent wave state
+  let currentWaveHeight = 0;
+  let currentWavePeriod = 0;
+  let lastWaveDetectedTime = Date.now();
 
   plugin.start = function (options) {
     if (!app) return;
@@ -103,7 +107,6 @@ module.exports = function (app) {
       app.debug('[RaceBox] ========== PLUGIN START ==========');
     }
 
-    // Cleanup stale keys from very old versions
     const staleKeys = ['enableIMU', 'triggerCalibration', 'triggerBleReset', 'calibrationOffsets'];
     const foundStale = staleKeys.filter((k) => k in activeOptions);
     if (foundStale.length > 0) {
@@ -113,7 +116,6 @@ module.exports = function (app) {
       });
     }
 
-    // Action: Reboot Bluetooth Stack
     if (activeOptions.rebootBluetoothStack) {
       app.setProviderStatus('RESET: Restarting Bluetooth service...');
       activeOptions.rebootBluetoothStack = false;
@@ -132,17 +134,13 @@ module.exports = function (app) {
       return;
     }
 
-    // Action: Arm Calibration
     if (activeOptions.zeroImuNow) {
       calibrationRequested = true;
       app.setProviderStatus('CAL: Armed for calibration. Boat must be level.');
       activeOptions.zeroImuNow = false;
       dataPacketCount = 0;
-      // We don't save here to avoid an immediate restart storm; 
-      // the flag will be cleared in the next successful offset save.
     }
 
-    // Small delay to ensure any previous zombie instance has released the BLE adapter
     setTimeout(() => {
       running = true;
       mainLoop().catch((e) => {
@@ -155,8 +153,6 @@ module.exports = function (app) {
     if (app) app.setProviderStatus('Stopped');
     running = false;
     sessionGeneration++;
-    // cleanupSession is async but SignalK stop is sync.
-    // The mainLoop and runSession watchdog will break and call cleanup.
   };
 
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -323,8 +319,6 @@ module.exports = function (app) {
       activeOptions.offsets = { pitch: calculatedPitch, roll: calculatedRoll };
       if (app) {
         app.setProviderStatus('Calibration captured and applied.');
-        // We save the offsets and the cleared zeroImuNow flag in one go.
-        // This will trigger one final restart to ensure a clean state.
         app.savePluginOptions(activeOptions, () => {});
       }
     }
@@ -354,45 +348,33 @@ module.exports = function (app) {
       const trueZ = -accelX * sinP + accelY * sinR * cosP + accelZ * cosR * cosP;
       const dynamicZ = (trueZ - 1.0) * 9.81;
 
-      values.push({ path: 'navigation.accel.trueZ', value: trueZ });
-
       velocityZ = (velocityZ + dynamicZ * DT) * LEAK;
       displacementZ = (displacementZ + velocityZ * DT) * LEAK;
 
       if (displacementZ > maxDisplacement) maxDisplacement = displacementZ;
       if (displacementZ < minDisplacement) minDisplacement = displacementZ;
 
+      const now = Date.now();
       if ((lastPitch >= 0 && finalPitch < 0) || (lastPitch <= 0 && finalPitch > 0)) {
         const waveHeight = maxDisplacement - minDisplacement;
-        const now = Date.now();
         const halfPeriod = (now - lastWaveTime) / 1000;
 
-        // More robust noise filters:
-        // 1. Minimum wave height (0.1m) to filter out table vibrations/noise
-        // 2. Minimum half-period (0.5s) to filter out high-frequency noise
-        // 3. Ensure we have enough data points (dataPacketCount > some threshold)
         if (waveHeight > 0.1 && halfPeriod > 0.5 && halfPeriod < 10) {
-          values.push(
-            { path: 'environment.wind.waveHeight', value: waveHeight },
-            { path: 'environment.wind.wavePeriod', value: halfPeriod * 2 }
-          );
-          waveMetricsReported = true;
+          currentWaveHeight = waveHeight;
+          currentWavePeriod = halfPeriod * 2;
+          lastWaveDetectedTime = now;
         }
 
-        // Reset for next half-cycle
         maxDisplacement = displacementZ;
         minDisplacement = displacementZ;
         lastWaveTime = now;
       }
       lastPitch = finalPitch;
 
-      // Auto-Zero wave metrics if no wave detected for 20 seconds
-      if (waveMetricsReported && (now - lastWaveTime > 20000)) {
-        values.push(
-          { path: 'environment.wind.waveHeight', value: 0 },
-          { path: 'environment.wind.wavePeriod', value: 0 }
-        );
-        waveMetricsReported = false;
+      // Auto-Zero if no wave detected for 20 seconds
+      if (now - lastWaveDetectedTime > 20000) {
+        currentWaveHeight = 0;
+        currentWavePeriod = 0;
       }
 
       const slamLimit = activeOptions.slamThreshold || 0.5;
@@ -403,13 +385,17 @@ module.exports = function (app) {
       }
 
       if (slamTimer > 0) {
-        values.push({ path: 'performance.hull.slamAcceleration', value: peakSlam });
         slamTimer--;
-        if (slamTimer === 0) {
-          values.push({ path: 'performance.hull.slamAcceleration', value: 0 });
-          peakSlam = 0;
-        }
+        if (slamTimer === 0) peakSlam = 0;
       }
+
+      // Persistent reporting: Always include these in the 25Hz delta
+      values.push(
+        { path: 'navigation.accel.trueZ', value: trueZ },
+        { path: 'environment.wind.waveHeight', value: currentWaveHeight },
+        { path: 'environment.wind.wavePeriod', value: currentWavePeriod },
+        { path: 'performance.hull.slamAcceleration', value: peakSlam }
+      );
     }
 
     const batteryByte = payload.readUInt8(67);
