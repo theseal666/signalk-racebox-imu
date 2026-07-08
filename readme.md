@@ -14,24 +14,42 @@ This plugin parses the RaceBox binary protocol (UBX-framed, per the official *Ra
 * **Zero Configuration Pairing:** Auto-discovers and connects to the first device advertising as "RaceBox".
 * **Full Telemetry Mapping:** Position, SOG, COG, Pitch, Roll, satellite count, battery status, and GPS accuracy.
 * **6-Axis IMU Streaming:** Raw accelerometer (X/Y/Z) and gyroscope (X/Y/Z) data at 25Hz.
-* **Experimental Wave & Slam Detection:** Advanced math (True Z rotation + leaky integration) to estimate wave height, period, and detect hull slams from the 6-axis IMU.
-* **Fix-Aware Position Gating:** Navigation data is only published with a valid GNSS fix.
-* **In-App Calibration:** Zero out Pitch & Roll offsets while the boat is level.
-* **Self-Healing Connection:** Automatic reconnect with backoff and data-staleness watchdog.
-* **High-Quality Codebase:** Decoupled metadata and automated unit tests for reliability.
+* **Experimental Wave & Slam Detection:** Advanced math (True Z rotation + leaky integration) to estimate wave height, period, and detect hull slams.
+* **High-Quality Codebase:** Decoupled metadata and automated unit tests for reliability and a high Signal K Registry score.
 
 ---
 
 ## Screenshots
 
-### Plugin Configuration & Experimental Settings
+### Plugin Configuration
 ![Plugin Settings](images/settings.png)
 
-### Live Data Stream (25Hz)
+### Live Data Stream
 ![Data Browser](images/data-browser.png)
 
 ### Connection Status
 ![Connection Status](images/status.png)
+
+---
+
+## Experimental: Wave & Performance Detection
+
+This plugin performs real-time processing of the 25Hz IMU stream to derive advanced metrics:
+
+### 1. True Vertical Acceleration (True Z)
+To isolate actual vertical motion from the boat's rotation, the plugin performs a 3D rotation of the raw accelerometer data into an Earth-fixed frame using the current Pitch and Roll.
+* **Path:** `navigation.accel.trueZ` (g)
+* **Math:** $a_z^{earth} = -a_x \sin(P) + a_y \sin(R)\cos(P) + a_z \cos(R)\cos(P)$
+
+### 2. Wave Height & Period
+Estimating wave height from acceleration requires double-integration. This plugin uses a **Leaky Integration (High-Pass Filter)** approach to prevent drift:
+* **Paths:** `environment.wind.waveHeight` (m), `environment.wind.wavePeriod` (s)
+* **Logic:** The boat's Pitch cycle identifies wave start/peak/end. We integrate vertical acceleration to velocity, then displacement. Wave height is the peak-to-peak displacement within each pitch-detected half-cycle.
+* **Persistence:** Metrics are reported at 25Hz and auto-reset to `0` after 20s of inactivity.
+
+### 3. Hull Slam Detection
+* **Path:** `performance.hull.slamAcceleration` (g)
+* **Logic:** Monitors `True Z` for impacts exceeding the configurable threshold. Uses a 1-second peak-hold to ensure the event is captured in logs.
 
 ---
 
@@ -66,58 +84,18 @@ Reload D-Bus: `sudo systemctl reload dbus`.
 
 ---
 
-## Installation
+## Installation & Development
 
-### Method 1: Via Signal K App Store (Recommended)
-1. Search for `signalk-racebox-imu` in **Appstore → Available**.
-2. Install and restart Signal K.
-
-### Method 2: Manual Installation
+### Manual Installation
 ```bash
 cd ~/.signalk
 npm install github:theseal666/signalk-racebox-imu#feature/quality-improvements
 sudo systemctl restart signalk
 ```
 
----
-
-## Configuration
-
-1. **Experimental Features:** Enable "EXPERIMENTAL: Enable Wave Height & Period detection" in settings.
-2. **Calibration:** Check "CALIBRATE IMU" while the boat is level and floating naturally.
-3. **Bluetooth Reset:** Use "RESET BLUETOOTH" to clear system-level connection lockups.
-
----
-
-## Signal K Paths Emitted
-
-### Navigation – Waves & Performance (Experimental)
-* `navigation.accel.trueZ` — Earth-fixed vertical acceleration (g)
-* `environment.wind.waveHeight` — Estimated peak-to-peak wave height (m)
-* `environment.wind.wavePeriod` — Estimated wave period (s)
-* `performance.hull.slamAcceleration` — Peak vertical impact acceleration (g)
-
-**Note:** When experimental features are enabled, these paths are persistently reported at 25Hz. If no waves are detected for 20 seconds, the values will automatically reset to `0` to ensure clean logging in tools like Expedition. Slam acceleration resets to `0` after a 1-second peak-hold.
-
-### Navigation – Core
-* `navigation.attitude.{roll, pitch}` — Calibrated orientation
-* `navigation.position`, `navigation.speedOverGround`, `navigation.courseOverGroundTrue`
-* `navigation.accel.{x, y, z}`, `navigation.gyro.{x, y, z}` (Raw 25Hz)
-
----
-
-## Development & Testing
-
-This plugin includes an automated test suite to verify the parser logic without needing a physical device.
-
+### Running Tests
 ```bash
-# Run tests
 npm test
-```
-
-To test with a live device, clone the repo and link it:
-```bash
-npm install https://github.com/theseal666/signalk-racebox-imu.git#feature/quality-improvements
 ```
 
 ---
