@@ -89,6 +89,7 @@ module.exports = function (app) {
   let minDisplacement = 0;
   let lastPitch = 0;
   let lastWaveTime = Date.now();
+  let waveMetricsReported = false;
   let peakSlam = 0;
   let slamTimer = 0;
 
@@ -375,6 +376,7 @@ module.exports = function (app) {
             { path: 'environment.wind.waveHeight', value: waveHeight },
             { path: 'environment.wind.wavePeriod', value: halfPeriod * 2 }
           );
+          waveMetricsReported = true;
         }
 
         // Reset for next half-cycle
@@ -383,6 +385,15 @@ module.exports = function (app) {
         lastWaveTime = now;
       }
       lastPitch = finalPitch;
+
+      // Auto-Zero wave metrics if no wave detected for 20 seconds
+      if (waveMetricsReported && (now - lastWaveTime > 20000)) {
+        values.push(
+          { path: 'environment.wind.waveHeight', value: 0 },
+          { path: 'environment.wind.wavePeriod', value: 0 }
+        );
+        waveMetricsReported = false;
+      }
 
       const slamLimit = activeOptions.slamThreshold || 0.5;
       const currentSlam = Math.abs(trueZ - 1.0);
@@ -394,7 +405,10 @@ module.exports = function (app) {
       if (slamTimer > 0) {
         values.push({ path: 'performance.hull.slamAcceleration', value: peakSlam });
         slamTimer--;
-        if (slamTimer === 0) peakSlam = 0;
+        if (slamTimer === 0) {
+          values.push({ path: 'performance.hull.slamAcceleration', value: 0 });
+          peakSlam = 0;
+        }
       }
     }
 
