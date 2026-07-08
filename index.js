@@ -3,7 +3,7 @@ const { exec } = require('child_process');
 
 module.exports = function (app) {
   const plugin = {};
-  plugin.id = 'racebox-signalk-plugin';
+  plugin.id = 'signalk-racebox-imu';
   plugin.name = 'RaceBox BLE Telemetry';
   plugin.description = 'Streams 25Hz GNSS and 6-Axis IMU data from RaceBox Mini/Micro directly into Signal K';
 
@@ -35,6 +35,18 @@ module.exports = function (app) {
   let currentDevice = null;
   let currentTxChar = null;
   let lastDataTime = 0;
+
+  \/\/ Wave detection pipeline state
+  const DT = 0.04;           \/\/ 25Hz sample rate
+  const LEAK = 0.98;         \/\/ High-pass filter leak factor for integration
+  let velocityZ = 0;
+  let displacementZ = 0;
+  let maxDisplacement = 0;
+  let minDisplacement = 0;
+  let lastPitch = 0;
+  let lastWaveTime = Date.now();
+  let peakSlam = 0;
+  let slamTimer = 0;
   let isMicro = false;       // RaceBox Micro reports input voltage instead of battery %
 
   // Dynamic config options inside the Signal K Admin UI
@@ -55,6 +67,16 @@ module.exports = function (app) {
         type: 'boolean',
         title: 'Enable debug logging to console',
         default: true
+      },
+      enableWaveDetection: {
+        type: 'boolean',
+        title: 'EXPERIMENTAL: Enable Wave Height & Period detection',
+        default: false
+      },
+      slamThreshold: {
+        type: 'number',
+        title: 'Hull Slam Threshold (G above baseline)',
+        default: 0.5
       },
       offsets: {
         type: 'object',
@@ -414,6 +436,63 @@ module.exports = function (app) {
       { path: 'navigation.gyro.y', value: gyroY },
       { path: 'navigation.gyro.z', value: gyroZ }
     );
+
+    \/\/ 1.5 Experimental Wave & Slam Detection
+    if (activeOptions.enableWaveDetection) {
+      \/\/ Rotate to Earth-fixed vertical frame (True Z)
+      \/\/ Formula: az_earth = -ax*sin(P) + ay*sin(R)*cos(P) + az*cos(R)*cos(P)
+      const sinP = Math.sin(finalPitch);
+      const cosP = Math.cos(finalPitch);
+      const sinR = Math.sin(finalRoll);
+      const cosR = Math.cos(finalRoll);
+
+      const trueZ = -accelX * sinP + accelY * sinR * cosP + accelZ * cosR * cosP;
+      const dynamicZ = (trueZ - 1.0) * 9.81; \/\/ Convert G to m\/s^2 and remove gravity
+
+      values.push({ path: 'navigation.accel.trueZ', value: trueZ });
+
+      \/\/ Leaky integration for velocity and displacement
+      velocityZ = (velocityZ + dynamicZ * DT) * LEAK;
+      displacementZ = (displacementZ + velocityZ * DT) * LEAK;
+
+      \/\/ Track min\/max displacement for wave height within the pitch cycle
+      if (displacementZ > maxDisplacement) maxDisplacement = displacementZ;
+      if (displacementZ < minDisplacement) minDisplacement = displacementZ;
+
+      \/\/ Detect wave cycle via Pitch zero-crossing (inflection points of the wave)
+      if ((lastPitch >= 0 && finalPitch < 0) || (lastPitch <= 0 && finalPitch > 0)) {
+        const waveHeight = maxDisplacement - minDisplacement;
+        const now = Date.now();
+        const halfPeriod = (now - lastWaveTime) \/ 1000;
+
+        if (waveHeight > 0.05 && halfPeriod > 0.2) { \/\/ Noise filters
+          values.push(
+            { path: 'environment.wind.waveHeight', value: waveHeight },
+            { path: 'environment.wind.wavePeriod', value: halfPeriod * 2 }
+          );
+        }
+
+        \/\/ Reset for next half-cycle
+        maxDisplacement = displacementZ;
+        minDisplacement = displacementZ;
+        lastWaveTime = now;
+      }
+      lastPitch = finalPitch;
+
+      \/\/ Hull Slam Detection (Peak-hold for 1 second)
+      const slamLimit = activeOptions.slamThreshold || 0.5;
+      const currentSlam = Math.abs(trueZ - 1.0);
+      if (currentSlam > slamLimit) {
+        if (currentSlam > peakSlam) peakSlam = currentSlam;
+        slamTimer = 25; \/\/ Hold for 25 samples @ 25Hz
+      }
+
+      if (slamTimer > 0) {
+        values.push({ path: 'performance.hull.slamAcceleration', value: peakSlam });
+        slamTimer--;
+        if (slamTimer === 0) peakSlam = 0;
+      }
+    }
 
     // 2. Read System State Metrics
     // Byte 67 is model-dependent (protocol rev 8):

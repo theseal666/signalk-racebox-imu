@@ -16,6 +16,7 @@ Bluetooth connectivity is handled by [`node-ble`](https://github.com/chrvadala/n
 * **Zero Configuration Pairing:** Auto-discovers and connects to the first device advertising as "RaceBox" — no MAC addresses to find or type.
 * **Full Telemetry Mapping:** Position, SOG, COG, Pitch, Roll, satellite count, battery status, and GPS accuracy.
 * **6-Axis IMU Streaming:** Raw accelerometer (X/Y/Z) and gyroscope (X/Y/Z) data at 25Hz.
+* **Experimental Wave & Slam Detection:** Advanced math (True Z rotation + leaky integration) to estimate wave height, period, and detect hull slams from the 6-axis IMU.
 * **Validated Protocol Parser:** Field offsets verified against the reference packet in the official RaceBox protocol documentation (rev 8).
 * **Fix-Aware Position Gating:** Position, SOG, and COG are only published when the receiver reports a valid 2D/3D fix, so you never get bogus coordinates during satellite acquisition.
 * **In-App Calibration:** Zero out Pitch & Roll offsets while the boat is level — saved to config for future sessions.
@@ -47,7 +48,7 @@ sudo tee /etc/dbus-1/system.d/signalk-ble.conf > /dev/null <<'EOF'
 <!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-BUS Bus Configuration 1.0//EN"
   "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
 <busconfig>
-  <policy user="YOUR_SIGNALK_USER">
+  <policy user="theseal666">
     <allow own="org.bluez"/>
     <allow send_destination="org.bluez"/>
     <allow send_interface="org.bluez.GattCharacteristic1"/>
@@ -60,7 +61,7 @@ EOF
 sudo systemctl reload dbus
 ```
 
-Replace `YOUR_SIGNALK_USER` with the actual username.
+Replace `theseal666` with your actual Linux username if it differs from your GitHub handle.
 
 > Unlike noble-based plugins, **no `setcap` on the node binary is required**, and the permissions survive Node.js upgrades.
 
@@ -91,8 +92,9 @@ sudo systemctl restart signalk
 1. Go to **Plugin Config** in the Signal K side menu.
 2. Select **RaceBox BLE Telemetry**.
 3. Turn on the plugin.
-4. **Calibrate IMU (Optional):** Place your boat level on calm water, check "CALIBRATE IMU" and click Save. The plugin captures Pitch & Roll offsets for your installation angle from the next data packet.
-5. **Bluetooth Reset (Emergency):** If the connection locks up, check "RESET BLUETOOTH" and click Save to restart the system Bluetooth service.
+4. **Experimental Features:** Check "EXPERIMENTAL: Enable Wave Height & Period detection" to start processing IMU data for waves and slams.
+5. **Calibrate IMU (Optional):** Place your boat level on calm water, check "CALIBRATE IMU" and click Save. The plugin captures Pitch & Roll offsets for your installation angle from the next data packet.
+6. **Bluetooth Reset (Emergency):** If the connection locks up, check "RESET BLUETOOTH" and click Save to restart the system Bluetooth service.
 
 ### Good to know
 
@@ -112,6 +114,12 @@ At up to 25Hz:
 * `navigation.courseOverGroundTrue` — Course over ground (radians, 0 = North)
 * `navigation.speedOverGround` — Speed over ground (m/s)
 * `navigation.gnss.type` — GNSS constellation in use
+
+### Navigation – Waves & Performance (Experimental)
+* `navigation.accel.trueZ` — Earth-fixed vertical acceleration (g), gravity-aware
+* `environment.wind.waveHeight` — Estimated peak-to-peak wave height (meters)
+* `environment.wind.wavePeriod` — Estimated wave period (seconds)
+* `performance.hull.slamAcceleration` — Peak vertical impact acceleration (g above baseline)
 
 ### Navigation – Attitude (Pitch/Roll)
 * `navigation.attitude.roll` — Roll angle (radians), calibration offset applied
