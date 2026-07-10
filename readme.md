@@ -69,10 +69,10 @@ Wave height is estimated using a **3-state Ornstein-Uhlenbeck Kalman filter**, t
 
 ## Live Visualization Webapp
 
-When wave detection is enabled, a browser-based live display is served at:
+When wave detection is enabled, a browser-based live display is available in Signal K's **Webapps** panel, or directly at:
 
 ```
-http://<your-signalk-host>/plugins/signalk-racebox-imu/
+http://<your-signalk-host>/signalk-racebox-imu/
 ```
 
 ![Webapp screenshot placeholder](https://raw.githubusercontent.com/theseal666/signalk-racebox-imu/main/images/webapp.png)

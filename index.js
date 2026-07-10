@@ -547,9 +547,6 @@ module.exports = function (app) {
   }
 
   plugin.registerWithRouter = function (router) {
-    const path    = require('path');
-    const express = require('express');
-    router.use('/', express.static(path.join(__dirname, 'public')));
     router.get('/status', (req, res) => {
       res.json({
         connected: !!currentDevice,
