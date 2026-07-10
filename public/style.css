@@ -1,0 +1,137 @@
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+    background: #0a0d14;
+    color: #e0e0e0;
+    height: 100dvh;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+}
+
+/* ── Header ──────────────────────────────────────────────────────────── */
+
+header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 10px 16px;
+    background: #111520;
+    border-bottom: 1px solid #1e2030;
+    flex-shrink: 0;
+}
+
+.title {
+    font-size: 0.85rem;
+    font-weight: 600;
+    color: #8898aa;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+}
+
+.badge {
+    font-size: 0.75rem;
+    font-weight: 600;
+    padding: 3px 10px;
+    border-radius: 10px;
+    transition: color 0.4s, background 0.4s;
+}
+
+.badge.live    { color: #4caf50; background: rgba(76, 175, 80, 0.12); }
+.badge.stale   { color: #ff9800; background: rgba(255, 152, 0, 0.12); }
+.badge.offline { color: #666;    background: rgba(100, 100, 100, 0.12); }
+
+/* ── Stat cards ──────────────────────────────────────────────────────── */
+
+#stats {
+    display: grid;
+    grid-template-columns: 1fr 1fr 1fr;
+    gap: 1px;
+    background: #1a1d28;
+    flex-shrink: 0;
+}
+
+.stat {
+    background: #0e1117;
+    padding: 10px 12px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+}
+
+.stat-label {
+    font-size: 0.65rem;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: #445566;
+    margin-bottom: 2px;
+}
+
+.stat-value {
+    font-size: 1.9rem;
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+    color: #d0dcf0;
+    line-height: 1.1;
+    transition: color 0.3s;
+}
+
+.stat-unit {
+    font-size: 0.65rem;
+    color: #334;
+    margin-top: 1px;
+}
+
+/* ── Heave chart ─────────────────────────────────────────────────────── */
+
+#chart-container {
+    flex: 1;
+    min-height: 0;
+    position: relative;
+}
+
+#heave-canvas {
+    width: 100%;
+    height: 100%;
+    display: block;
+}
+
+/* ── Attitude row ────────────────────────────────────────────────────── */
+
+#attitude {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    padding: 8px 16px;
+    background: #0e1117;
+    border-top: 1px solid #1a1d28;
+    flex-shrink: 0;
+    height: 84px;
+}
+
+#horizon-canvas {
+    width: 68px;
+    height: 68px;
+    display: block;
+    flex-shrink: 0;
+    border-radius: 50%;
+}
+
+#attitude-values {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+.att-row {
+    font-size: 0.8rem;
+    color: #556677;
+}
+
+.att-row span {
+    color: #c0ccdd;
+    font-variant-numeric: tabular-nums;
+    font-size: 0.9rem;
+    margin-left: 4px;
+}

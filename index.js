@@ -233,6 +233,7 @@ module.exports = function (app) {
         updates: [{
           meta: [
             { path: 'navigation.accel.trueZ', value: { units: 'm/s2' } },
+            { path: 'navigation.imu.heaveDisplacement', value: { units: 'm' } },
             { path: 'environment.wind.waveHeight', value: { units: 'm' } },
             { path: 'environment.wind.wavePeriod', value: { units: 's' } },
             { path: 'performance.hull.slamAcceleration', value: { units: 'm/s2' } },
@@ -502,11 +503,12 @@ module.exports = function (app) {
 
       // Persistent reporting: Always include these in the 25Hz delta
       values.push(
-        { path: 'navigation.accel.trueZ', value: trueZMS2 },
-        { path: 'environment.wind.waveHeight', value: currentWaveHeight },
-        { path: 'environment.wind.wavePeriod', value: currentWavePeriod },
+        { path: 'navigation.accel.trueZ',          value: trueZMS2 },
+        { path: 'navigation.imu.heaveDisplacement', value: kfS },
+        { path: 'environment.wind.waveHeight',      value: currentWaveHeight },
+        { path: 'environment.wind.wavePeriod',      value: currentWavePeriod },
         { path: 'performance.hull.slamAcceleration', value: peakSlam },
-        { path: 'performance.hull.slamAngularJolt', value: gyroJolt }
+        { path: 'performance.hull.slamAngularJolt',  value: gyroJolt }
       );
     }
 
@@ -543,6 +545,23 @@ module.exports = function (app) {
       });
     }
   }
+
+  plugin.registerWithRouter = function (router) {
+    const path    = require('path');
+    const express = require('express');
+    router.use('/', express.static(path.join(__dirname, 'public')));
+    router.get('/status', (req, res) => {
+      res.json({
+        connected: !!currentDevice,
+        isMicro,
+        waveDetection: !!(activeOptions && activeOptions.enableWaveDetection),
+        packetCount: dataPacketCount,
+        kfState: { s: kfS, v: kfV, b: kfB },
+        currentHs: currentWaveHeight,
+        currentPeriod: currentWavePeriod,
+      });
+    });
+  };
 
   return plugin;
 };
