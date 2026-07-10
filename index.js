@@ -37,6 +37,24 @@ const pluginMetadata = {
         title: 'Hull Slam Threshold (G above baseline)',
         default: 0.5
       },
+      waveFilterPeriod: {
+        type: 'number',
+        title: 'Wave Filter: Dominant Period (seconds)',
+        description: 'Starting estimate of the dominant wave period used by the Ornstein-Uhlenbeck Kalman filter. Use 3–6 s for Baltic or coastal chop; 7–12 s for open-ocean swell. The filter is tolerant of a rough estimate here — it does not need to be exact.',
+        default: 8.0
+      },
+      waveFilterDamping: {
+        type: 'number',
+        title: 'Wave Filter: Damping Ratio (ζ, 0.05–0.50)',
+        description: 'Controls how quickly oscillations decay in the wave model. Lower values (0.05–0.10) suit long ocean swell that rings for many cycles. Higher values (0.25–0.40) suit short, steep chop that damps quickly. Leave at 0.15 for most conditions.',
+        default: 0.15
+      },
+      waveHsWindow: {
+        type: 'number',
+        title: 'Wave Filter: Hs Window (seconds, 30–300)',
+        description: 'Duration of the rolling window used to compute Significant Wave Height (Hs = 4σ, the oceanographic standard). Longer windows (120–300 s) give a stable, slow-moving reading. Shorter windows (30–60 s) respond faster to changing conditions but are noisier. Requires 30 s of data before Hs is published.',
+        default: 120
+      },
       offsets: {
         type: 'object',
         title: 'Saved Calibration Pitch/Roll Offsets (radians)',
@@ -48,6 +66,18 @@ const pluginMetadata = {
     }
   }
 };
+
+// 3×3 matrix helpers for the OU Kalman wave-height filter
+function mat3Mul(A, B) {
+  const C = [[0,0,0],[0,0,0],[0,0,0]];
+  for (let i=0;i<3;i++) for (let j=0;j<3;j++) for (let k=0;k<3;k++) C[i][j]+=A[i][k]*B[k][j];
+  return C;
+}
+function mat3T(A) {
+  return [[A[0][0],A[1][0],A[2][0]],[A[0][1],A[1][1],A[2][1]],[A[0][2],A[1][2],A[2][2]]];
+}
+function mat3Add(A,B){return A.map((r,i)=>r.map((v,j)=>v+B[i][j]));}
+function mat3Sub(A,B){return A.map((r,i)=>r.map((v,j)=>v-B[i][j]));}
 
 module.exports = function (app) {
   const plugin = { ...pluginMetadata };
@@ -81,19 +111,22 @@ module.exports = function (app) {
   let isMicro = false;
 
   // Wave detection pipeline state
-  const DT = 0.04;           // 25Hz sample rate
-  const LEAK = 0.98;         // High-pass filter leak factor for integration
-  let velocityZ = 0;
-  let displacementZ = 0;
-  let maxDisplacement = 0;
-  let minDisplacement = 0;
-  let lastPitch = 0;
-  let lastWaveTime = Date.now();
+  const DT = 0.04;  // 25Hz sample rate
+
+  // OU Kalman state: heave displacement (m), heave velocity (m/s), accel bias (m/s²)
+  // Algorithm: Ornstein-Uhlenbeck Kalman filter for ship heave — see README and
+  // github.com/bareboat-necessities/ocean-imu for the underlying theory.
+  let kfS = 0, kfV = 0, kfB = 0;
+  let kfP = [[1,0,0],[0,1,0],[0,0,1]];  // error covariance, reset to identity each start
+  let heaveWindow = [];                  // rolling displacement samples for Hs = 4σ
+  let heaveUpdateCounter = 0;           // throttles Hs recomputation to once per second
+  let zeroXingTimes = [];               // timestamps of upward heave zero-crossings
+  let prevHeavePosSign = false;
   let lastGyro = { x: 0, y: 0, z: 0 };
   let peakSlam = 0;
   let slamTimer = 0;
 
-  // Persistent wave state
+  // Persistent wave output
   let currentWaveHeight = 0;
   let currentWavePeriod = 0;
   let lastWaveDetectedTime = Date.now();
@@ -362,37 +395,79 @@ module.exports = function (app) {
       const sinR = Math.sin(finalRoll);
       const cosR = Math.cos(finalRoll);
 
-      const trueZ = -accelX * sinP + accelY * sinR * cosP + accelZ * cosR * cosP;
-      const trueZMS2 = trueZ * 9.80665; // Earth-fixed vertical in m/s2
-      const dynamicZ = (trueZ - 1.0) * 9.80665; // Dynamic vertical in m/s2
+      const trueZ    = -accelX * sinP + accelY * sinR * cosP + accelZ * cosR * cosP;
+      const trueZMS2 = trueZ * 9.80665;
+      const dynamicZ = (trueZ - 1.0) * 9.80665;  // dynamic vertical accel (m/s²)
 
-      velocityZ = (velocityZ + dynamicZ * DT) * LEAK;
-      displacementZ = (displacementZ + velocityZ * DT) * LEAK;
+      // --- OU Kalman filter for heave displacement ---
+      // State x = [s (heave m), v (heave vel m/s), b (accel bias m/s²)]
+      // Model: s'' = -ω₀²·s − 2ζω₀·v  (damped harmonic oscillator / OU process)
+      // Observation: z = s'' + b + noise  →  H = [-ω₀², -2ζω₀, 1]
+      const omega0 = 2 * Math.PI / Math.max(activeOptions.waveFilterPeriod || 8.0, 2.0);
+      const zeta   = Math.min(Math.max(activeOptions.waveFilterDamping  || 0.15, 0.01), 0.50);
+      const omSq   = omega0 * omega0;
+      const damp2  = 2 * zeta * omega0;
 
-      if (displacementZ > maxDisplacement) maxDisplacement = displacementZ;
-      if (displacementZ < minDisplacement) minDisplacement = displacementZ;
+      // Noise constants (fixed): Q_V = wave energy forcing; Q_B = bias drift; R_A = accel noise
+      const Q_V = 0.25, Q_B = 1e-6, R_A = 9e-4;
 
-      const now = Date.now();
-      if ((lastPitch >= 0 && finalPitch < 0) || (lastPitch <= 0 && finalPitch > 0)) {
-        const waveHeight = maxDisplacement - minDisplacement;
-        const halfPeriod = (now - lastWaveTime) / 1000;
+      // Predict step
+      const sP  = kfS + DT * kfV;
+      const vP  = kfV + DT * (-omSq * kfS - damp2 * kfV);
+      const bP  = kfB;
+      const Phi = [[1, DT, 0], [-omSq * DT, 1 - damp2 * DT, 0], [0, 0, 1]];
+      const Q   = [[0, 0, 0], [0, Q_V, 0], [0, 0, Q_B]];
+      const Pp  = mat3Add(mat3Mul(mat3Mul(Phi, kfP), mat3T(Phi)), Q);
 
-        if (waveHeight > 0.1 && halfPeriod > 0.5 && halfPeriod < 10) {
-          currentWaveHeight = waveHeight;
-          currentWavePeriod = halfPeriod * 2;
-          lastWaveDetectedTime = now;
-        }
+      // Update step
+      const H   = [-omSq, -damp2, 1];
+      const inn = dynamicZ - (H[0]*sP + H[1]*vP + H[2]*bP);
+      const HP  = [H[0]*Pp[0][0]+H[1]*Pp[1][0]+H[2]*Pp[2][0],
+                   H[0]*Pp[0][1]+H[1]*Pp[1][1]+H[2]*Pp[2][1],
+                   H[0]*Pp[0][2]+H[1]*Pp[1][2]+H[2]*Pp[2][2]];
+      const Sinv = 1 / (HP[0]*H[0] + HP[1]*H[1] + HP[2]*H[2] + R_A);
+      const K   = [(Pp[0][0]*H[0]+Pp[0][1]*H[1]+Pp[0][2]*H[2])*Sinv,
+                   (Pp[1][0]*H[0]+Pp[1][1]*H[1]+Pp[1][2]*H[2])*Sinv,
+                   (Pp[2][0]*H[0]+Pp[2][1]*H[1]+Pp[2][2]*H[2])*Sinv];
+      kfS = sP + K[0]*inn;  kfV = vP + K[1]*inn;  kfB = bP + K[2]*inn;
+      kfP = mat3Mul(mat3Sub([[1,0,0],[0,1,0],[0,0,1]],
+                             [[K[0]*H[0],K[0]*H[1],K[0]*H[2]],
+                              [K[1]*H[0],K[1]*H[1],K[1]*H[2]],
+                              [K[2]*H[0],K[2]*H[1],K[2]*H[2]]]), Pp);
 
-        maxDisplacement = displacementZ;
-        minDisplacement = displacementZ;
-        lastWaveTime = now;
+      // Significant wave height: Hs = 4σ of heave displacement (oceanographic standard)
+      const windowSamples = Math.round((activeOptions.waveHsWindow || 120) * 25);
+      heaveWindow.push(kfS);
+      if (heaveWindow.length > windowSamples) heaveWindow.shift();
+      heaveUpdateCounter = (heaveUpdateCounter + 1) % 25;
+      if (heaveWindow.length >= 750 && heaveUpdateCounter === 0) {
+        const mean = heaveWindow.reduce((a, b) => a + b, 0) / heaveWindow.length;
+        const variance = heaveWindow.reduce((a, v) => a + (v - mean) * (v - mean), 0) / heaveWindow.length;
+        const hs = 4 * Math.sqrt(variance);
+        if (hs > 0.05) { currentWaveHeight = hs; lastWaveDetectedTime = Date.now(); }
       }
-      lastPitch = finalPitch;
 
-      // Auto-Zero if no wave detected for 20 seconds
-      if (now - lastWaveDetectedTime > 20000) {
+      // Wave period from upward zero-crossings of filtered heave
+      const isPos = kfS > 0;
+      if (!prevHeavePosSign && isPos) {
+        zeroXingTimes.push(Date.now());
+        if (zeroXingTimes.length > 6) zeroXingTimes.shift();
+        if (zeroXingTimes.length >= 3) {
+          let total = 0;
+          for (let i = 1; i < zeroXingTimes.length; i++) total += zeroXingTimes[i] - zeroXingTimes[i-1];
+          const T = (total / (zeroXingTimes.length - 1)) / 1000;
+          if (T > 1.5 && T < 25) currentWavePeriod = T;
+        }
+      }
+      prevHeavePosSign = isPos;
+
+      // Auto-zero and flush buffers if no wave activity for 60s
+      const now = Date.now();
+      if (now - lastWaveDetectedTime > 60000) {
         currentWaveHeight = 0;
         currentWavePeriod = 0;
+        heaveWindow.length = 0;
+        zeroXingTimes.length = 0;
       }
 
       // Complex Slam Detection (Multi-vector impact analysis)

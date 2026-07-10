@@ -16,7 +16,7 @@ Bluetooth connectivity is handled by [`node-ble`](https://github.com/chrvadala/n
 * **Zero Configuration Pairing:** Auto-discovers and connects to the first device advertising as "RaceBox" — no MAC addresses to find or type.
 * **Full Telemetry Mapping:** Position, SOG, COG, Pitch, Roll, satellite count, battery status, and GPS accuracy.
 * **6-Axis IMU Streaming:** Raw accelerometer (X/Y/Z) and gyroscope (X/Y/Z) data at 25Hz.
-* **Experimental Wave & Slam Detection:** Advanced math (True Z rotation + leaky integration) to estimate wave height, period, and detect complex hull slams.
+* **Experimental Wave & Slam Detection:** OU Kalman filter for significant wave height (Hs = 4σ) and period, plus complex hull slam detection.
 * **Fix-Aware Position Gating:** Position, SOG, and COG are only published when the receiver reports a valid 2D/3D fix.
 * **In-App Calibration:** Zero out Pitch & Roll offsets while the boat is level — saved to config for future sessions.
 * **Self-Healing Connection:** Automatic reconnect with backoff, plus a data-staleness watchdog that tears down and re-establishes a silent connection.
@@ -46,11 +46,17 @@ To isolate actual vertical motion from the boat's rotation, the plugin performs 
 * **Path:** `navigation.accel.trueZ` (m/s²)
 * **Math:** $a_z^{earth} = -a_x \sin(P) + a_y \sin(R)\cos(P) + a_z \cos(R)\cos(P)$
 
-### 2. Wave Height & Period
-Estimating wave height from acceleration requires double-integration. This plugin uses a **Leaky Integration (High-Pass Filter)** approach to prevent drift:
+### 2. Wave Height & Period (OU Kalman Filter)
+Wave height is estimated using a **3-state Ornstein-Uhlenbeck Kalman filter**, treating vertical heave as a damped harmonic oscillator driven by stochastic wave forcing. This replaces the earlier leaky-integrator approach.
+
 * **Paths:** `environment.wind.waveHeight` (m), `environment.wind.wavePeriod` (s)
-* **Logic:** The boat's Pitch cycle identifies wave start/peak/end. We integrate vertical acceleration to velocity, then displacement. Wave height is the peak-to-peak displacement within each pitch-detected half-cycle.
-* **Persistence:** Metrics are reported at 25Hz and auto-reset to `0` after 20s of inactivity to ensure clean logging.
+* **State vector:** `[heave displacement, heave velocity, accelerometer bias]` — bias is estimated and removed automatically by the filter.
+* **Significant Wave Height:** Hs = 4σ over a configurable rolling window (e.g. 120 s). This is the standard oceanographic definition, not a single-wave peak-to-peak.
+* **Wave Period:** Measured from upward zero-crossings of the filtered heave displacement (rolling average of the last 5 crossings).
+* **Tuning:** Dominant wave period, damping ratio (ζ), and the Hs window duration are all adjustable in the plugin settings. Defaults suit open-ocean swell; reduce the period for Baltic or coastal chop.
+* **Warmup:** Hs output is held at `0` for the first 30 s while the filter accumulates a meaningful data window. Values auto-reset if no wave activity is detected for 60 s.
+
+> **Algorithm credit:** The OU Kalman approach for ship heave estimation is based on the work by [bareboat-necessities](https://github.com/bareboat-necessities/ocean-imu) — specifically the *Kalman OU-W3D* paper published in that repository. The paper demonstrates that modelling heave as an OU (mean-reverting) process solves the drift problem inherent in naive double-integration, and that "heave is strongly observable" from a single vertical accelerometer. The full C++ implementation covers 3D vessel motion (surge, sway, heave); this plugin implements the 1D heave-only case appropriate for a single RaceBox IMU.
 
 ### 3. Complex Slam Detection
 * **Path:** `performance.hull.slamAcceleration` (m/s²), `performance.hull.slamAngularJolt` (rad/s²)
