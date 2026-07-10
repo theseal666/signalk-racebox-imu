@@ -60,7 +60,7 @@ Wave period: rolling mean of upward zero-crossing intervals of filtered heave.
 - `R_A = 9e-4` — accelerometer measurement noise variance (≈ 0.03 m/s²)²
 
 **Live visualization webapp** (`public/`):
-- Served at `/plugins/signalk-racebox-imu/` by the Signal K admin server
+- Registered as `signalk-webapp` — appears in Signal K Webapps panel at `/signalk-racebox-imu/`
 - Scrolling 30s heave displacement chart (canvas, 60fps via requestAnimationFrame)
 - ±Hs/2 band overlay on the trace (= ±2σ region)
 - Slam events as red timeline flashes
