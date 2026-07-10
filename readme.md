@@ -17,6 +17,7 @@ Bluetooth connectivity is handled by [`node-ble`](https://github.com/chrvadala/n
 * **Full Telemetry Mapping:** Position, SOG, COG, Pitch, Roll, satellite count, battery status, and GPS accuracy.
 * **6-Axis IMU Streaming:** Raw accelerometer (X/Y/Z) and gyroscope (X/Y/Z) data at 25Hz.
 * **Experimental Wave & Slam Detection:** OU Kalman filter for significant wave height (Hs = 4σ) and period, plus complex hull slam detection.
+* **Live Visualization Webapp:** Built-in browser UI served directly from Signal K — scrolling heave trace, artificial horizon, and wave stats.
 * **Fix-Aware Position Gating:** Position, SOG, and COG are only published when the receiver reports a valid 2D/3D fix.
 * **In-App Calibration:** Zero out Pitch & Roll offsets while the boat is level — saved to config for future sessions.
 * **Self-Healing Connection:** Automatic reconnect with backoff, plus a data-staleness watchdog that tears down and re-establishes a silent connection.
@@ -63,6 +64,26 @@ Wave height is estimated using a **3-state Ornstein-Uhlenbeck Kalman filter**, t
 * **Logic:** Monitors the **3D G-Force Resultant** magnitude. This captures impacts from any direction (side hits, bow-on slams, or falling off waves).
 * **Angular Jolt:** Measures the derivative of angular rates to capture sudden, violent orientation changes.
 * **Persistence:** Uses a 1-second peak-hold to ensure events are captured in logs.
+
+---
+
+## Live Visualization Webapp
+
+When wave detection is enabled, a browser-based live display is served at:
+
+```
+http://<your-signalk-host>/plugins/signalk-racebox-imu/
+```
+
+![Webapp screenshot placeholder](https://raw.githubusercontent.com/theseal666/signalk-racebox-imu/main/images/webapp.png)
+
+The webapp connects directly to the Signal K WebSocket stream and shows:
+
+* **Heave trace** — 30-second scrolling canvas of the Kalman-filtered heave displacement (blue line). The green dashed band marks ±Hs/2 (= ±2σ), so roughly 95 % of individual wave heights fall inside it. Red flashes mark slam events.
+* **Stat cards** — Hs (m), dominant wave period (s), and peak slam acceleration (m/s²) with colour warnings.
+* **Artificial horizon** — live pitch and roll attitude indicator.
+
+The webapp auto-reconnects if the Signal K connection drops and requires no installation — just open it in any browser on the same network as your Signal K server.
 
 ---
 
@@ -130,6 +151,7 @@ npm test
 
 ### Experimental (Enabled in Config)
 * `navigation.accel.trueZ` (m/s²)
+* `navigation.imu.heaveDisplacement` (m) — Kalman-filtered vertical heave displacement
 * `environment.wind.waveHeight` (m), `environment.wind.wavePeriod` (s)
 * `performance.hull.slamAcceleration` (m/s²), `performance.hull.slamAngularJolt` (rad/s²)
 

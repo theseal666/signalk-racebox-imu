@@ -15,9 +15,9 @@ Initial release: BLE via `@abandonware/noble`, 25Hz telemetry streaming, full UB
 - Async session loop with per-step timeouts and data-staleness watchdog
 - RaceBox Micro vs Mini auto-detection (voltage path vs battery %)
 
-## In Progress
+### v1.3.0 — 2026-07-10
+**OU Kalman wave height filter + live visualization webapp**
 
-### v1.2.0 — OU Kalman Wave Height Filter
 Replaces the leaky double-integrator approach for heave estimation with a proper
 3-state Ornstein-Uhlenbeck Kalman filter.
 
@@ -58,6 +58,15 @@ Wave period: rolling mean of upward zero-crossing intervals of filtered heave.
 - `Q_V = 0.25` — wave energy forcing variance per step (m/s²)²
 - `Q_B = 1e-6` — bias drift variance per step
 - `R_A = 9e-4` — accelerometer measurement noise variance (≈ 0.03 m/s²)²
+
+**Live visualization webapp** (`public/`):
+- Served at `/plugins/signalk-racebox-imu/` by the Signal K admin server
+- Scrolling 30s heave displacement chart (canvas, 60fps via requestAnimationFrame)
+- ±Hs/2 band overlay on the trace (= ±2σ region)
+- Slam events as red timeline flashes
+- Artificial horizon with live pitch/roll
+- Hs, Period, Slam stat cards — data via Signal K WebSocket, auto-reconnects
+- New path: `navigation.imu.heaveDisplacement` (m) — the Kalman-filtered heave state
 
 ## Backlog
 
