@@ -135,3 +135,49 @@ header {
     font-size: 0.9rem;
     margin-left: 4px;
 }
+
+/* ── Calibration panel ───────────────────────────────────────────────── */
+
+#cal-panel {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-end;
+    gap: 6px;
+    margin-left: auto;
+    text-align: right;
+}
+
+.cal-btn {
+    font-family: inherit;
+    font-size: 0.8rem;
+    font-weight: 600;
+    color: #cddcf0;
+    background: #1a2436;
+    border: 1px solid #2a3a54;
+    border-radius: 7px;
+    padding: 8px 14px;
+    cursor: pointer;
+    transition: background 0.15s, border-color 0.15s;
+    white-space: nowrap;
+}
+
+.cal-btn:hover:not(:disabled)  { background: #223250; border-color: #3a5a86; }
+.cal-btn:active:not(:disabled) { background: #16202f; }
+.cal-btn:disabled {
+    color: #556;
+    background: #12161f;
+    border-color: #1c2432;
+    cursor: default;
+}
+
+.cal-status {
+    font-size: 0.68rem;
+    color: #556677;
+    max-width: 180px;
+    line-height: 1.3;
+    min-height: 1em;
+}
+
+.cal-status.armed { color: #ff9800; }
+.cal-status.ok    { color: #4caf50; }
+.cal-status.err    { color: #ff5252; }

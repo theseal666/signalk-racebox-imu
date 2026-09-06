@@ -19,7 +19,7 @@ Bluetooth connectivity is handled by [`node-ble`](https://github.com/chrvadala/n
 * **Experimental Wave & Slam Detection:** OU Kalman filter for significant wave height (Hs = 4σ) and period, plus complex hull slam detection.
 * **Live Visualization Webapp:** Built-in browser UI served directly from Signal K — scrolling heave trace, artificial horizon, and wave stats.
 * **Fix-Aware Position Gating:** Position, SOG, and COG are only published when the receiver reports a valid 2D/3D fix.
-* **In-App Calibration:** Zero out Pitch & Roll offsets while the boat is level — saved to config for future sessions.
+* **One-Click Live Calibration:** A "Calibrate Level" button right on the live dashboard zeroes out Pitch & Roll while the boat is level and saves it immediately — no need to open Plugin Config, tick a checkbox, and trigger a full Bluetooth reconnect.
 * **Self-Healing Connection:** Automatic reconnect with backoff, plus a data-staleness watchdog that tears down and re-establishes a silent connection.
 * **High-Quality Codebase:** Decoupled metadata and automated unit tests for reliability and a high Signal K Registry score.
 
@@ -84,6 +84,18 @@ The webapp connects directly to the Signal K WebSocket stream and shows:
 * **Artificial horizon** — live pitch and roll attitude indicator.
 
 The webapp auto-reconnects if the Signal K connection drops and requires no installation — just open it in any browser on the same network as your Signal K server.
+
+### Calibrate Level (one-click IMU calibration)
+
+The dashboard includes a **Calibrate Level** button next to the artificial horizon. Click it while the boat is stationary and level (floating naturally, not on a dock line pulling it over) to zero out the current Pitch & Roll reading as the new baseline offset.
+
+Unlike the older **CALIBRATE IMU** checkbox in Plugin Config — which only takes effect after clicking **Save**, and Save restarts the plugin (`stop()` + `start()`), causing a full Bluetooth disconnect/reconnect that can take up to ~30 seconds — this button arms the calibration on the *already-running* session. The very next incoming RaceBox packet captures the offset and the live data stream is never interrupted.
+
+Under the hood this is served by the plugin's own REST endpoints:
+* `POST /plugins/signalk-racebox-imu/calibrate` — arms the calibration; returns `409` if no RaceBox is currently connected.
+* `GET /plugins/signalk-racebox-imu/status` — connection state, packet count, current Kalman filter state, wave stats, `calibrationArmed`, saved `offsets`, and `lastCalibratedAt`.
+
+The Plugin Config checkbox still works exactly as before for anyone who prefers it; the two methods write to the same saved `offsets` config value.
 
 ---
 

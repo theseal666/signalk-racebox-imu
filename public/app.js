@@ -9,6 +9,14 @@ const vals = { hs: 0, period: 0, slam: 0, pitch: 0, roll: 0 };
 let lastDataMs = 0;
 let connected  = false;
 
+// This page is reachable both from the plugin's own router
+// (/plugins/signalk-racebox-imu/) and from Signal K's generic webapp static
+// hosting (/signalk-racebox-imu/, via the signalk-webapp package.json
+// keyword) — only the former actually has the /status and /calibrate
+// routes behind it, so always hit the API by its real absolute path
+// rather than a relative one that 404s from the second entry point.
+const API_BASE = '/plugins/signalk-racebox-imu/';
+
 // ── WebSocket ──────────────────────────────────────────────────────────────
 
 function connect() {
@@ -246,6 +254,90 @@ function updateStats() {
     document.getElementById('val-pitch').textContent = deg(vals.pitch);
     document.getElementById('val-roll').textContent  = deg(vals.roll);
 }
+
+// ── Calibration button ──────────────────────────────────────────────────────
+// Click "Calibrate Level" -> POST /calibrate arms the plugin to capture the
+// current accelerometer-derived pitch/roll as the new zero offset on the
+// very next incoming RaceBox packet (no BLE reconnect, no gap in the live
+// data — see index.js). We then poll /status for a couple of seconds to
+// confirm it actually fired (lastCalibratedAt advancing) rather than just
+// assuming the click worked, since it only takes effect once the boat is
+// genuinely level and a packet arrives.
+
+const calBtn    = document.getElementById('cal-btn');
+const calStatus = document.getElementById('cal-status');
+let calPollTimer = null;
+let calArmedAt = null;
+let knownLastCalibratedAt = null;
+
+function setCalStatus(text, cls) {
+    calStatus.textContent = text;
+    calStatus.className = 'cal-status' + (cls ? ' ' + cls : '');
+}
+
+async function fetchStatus() {
+    const res = await fetch(API_BASE + 'status');
+    if (!res.ok) throw new Error(await res.text());
+    return res.json();
+}
+
+// Baseline what "already calibrated" looks like on load, so the very first
+// button press isn't mistaken for having already succeeded before it did.
+fetchStatus().then(s => { knownLastCalibratedAt = s.lastCalibratedAt; }).catch(() => {});
+
+function stopCalPoll() {
+    if (calPollTimer) { clearInterval(calPollTimer); calPollTimer = null; }
+}
+
+function startCalPoll() {
+    stopCalPoll();
+    const startedAt = Date.now();
+    calPollTimer = setInterval(async () => {
+        let s;
+        try {
+            s = await fetchStatus();
+        } catch (e) {
+            return; // transient — keep waiting rather than flashing an error
+        }
+        if (s.lastCalibratedAt && s.lastCalibratedAt !== knownLastCalibratedAt) {
+            knownLastCalibratedAt = s.lastCalibratedAt;
+            const pitchDeg = (s.offsets.pitch * 180 / Math.PI).toFixed(1);
+            const rollDeg  = (s.offsets.roll  * 180 / Math.PI).toFixed(1);
+            setCalStatus(`Calibrated ✓  pitch ${pitchDeg}°  roll ${rollDeg}°`, 'ok');
+            calBtn.disabled = false;
+            stopCalPoll();
+            setTimeout(() => setCalStatus(''), 6000);
+            return;
+        }
+        // Still armed and waiting for a packet — give it up to 8s (should
+        // normally resolve within one packet interval at 25Hz) before
+        // telling the user something's off rather than polling forever.
+        if (Date.now() - startedAt > 8000) {
+            setCalStatus('No confirmation yet — check the connection.', 'err');
+            calBtn.disabled = false;
+            stopCalPoll();
+        }
+    }, 500);
+}
+
+calBtn.addEventListener('click', async () => {
+    calBtn.disabled = true;
+    setCalStatus('Arming — hold the boat level…', 'armed');
+    try {
+        const res = await fetch(API_BASE + 'calibrate', { method: 'POST' });
+        const body = await res.json().catch(() => ({}));
+        if (!res.ok) {
+            setCalStatus(body.error || 'Calibration request failed.', 'err');
+            calBtn.disabled = false;
+            return;
+        }
+        calArmedAt = Date.now();
+        startCalPoll();
+    } catch (e) {
+        setCalStatus('Could not reach the plugin.', 'err');
+        calBtn.disabled = false;
+    }
+});
 
 // ── Animation loop ─────────────────────────────────────────────────────────
 

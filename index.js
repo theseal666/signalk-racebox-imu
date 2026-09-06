@@ -99,6 +99,11 @@ module.exports = function (app) {
   // Runtime State
   let rxBuffer = Buffer.alloc(0);
   let calibrationRequested = false;
+  // Set the instant a calibration is captured (parseRaceBoxData) so the
+  // live UI's "Calibrate Now" button can tell a request was actually
+  // fulfilled, rather than just optimistically assuming it worked the
+  // moment the button was clicked.
+  let lastCalibratedAt = null;
   let activeOptions = {};
   let dataPacketCount = 0;
   let debug = false;
@@ -217,7 +222,7 @@ module.exports = function (app) {
   async function runSession(gen) {
     if (!app) return;
     app.setProviderStatus('Initializing Bluetooth...');
-    
+
     btContext = createBluetooth();
     const adapter = await withTimeout(btContext.bluetooth.defaultAdapter(), ADAPTER_TIMEOUT, 'Bluetooth adapter init');
 
@@ -290,7 +295,7 @@ module.exports = function (app) {
 
     app.setProviderStatus('Subscribing to telemetry...');
     await withTimeout(txChar.startNotifications(), GATT_TIMEOUT, 'Subscription');
-    
+
     if (running && gen === sessionGeneration) {
       app.setProviderStatus('Streaming live data.');
     }
@@ -368,6 +373,7 @@ module.exports = function (app) {
     if (calibrationRequested) {
       calibrationRequested = false;
       activeOptions.offsets = { pitch: calculatedPitch, roll: calculatedRoll };
+      lastCalibratedAt = Date.now();
       if (app) {
         app.setProviderStatus('Calibration captured and applied.');
         app.savePluginOptions(activeOptions, () => {});
@@ -473,7 +479,7 @@ module.exports = function (app) {
 
       // Complex Slam Detection (Multi-vector impact analysis)
       const slamLimit = activeOptions.slamThreshold || 0.5;
-      
+
       // 1. G-Force Resultant (Impacts from any direction)
       const gResultant = Math.sqrt(accelX * accelX + accelY * accelY + accelZ * accelZ);
       const gImpact = Math.abs(gResultant - 1.0); // Deviation from 1G baseline
@@ -489,7 +495,7 @@ module.exports = function (app) {
       lastGyro = { x: gyroX, y: gyroY, z: gyroZ };
 
       // Unified Slam Metric (Converted to SI: m/s2)
-      const currentSlam = gImpact * 9.80665; 
+      const currentSlam = gImpact * 9.80665;
 
       if (currentSlam > (slamLimit * 9.80665)) {
         if (currentSlam > peakSlam) peakSlam = currentSlam;
@@ -556,7 +562,29 @@ module.exports = function (app) {
         kfState: { s: kfS, v: kfV, b: kfB },
         currentHs: currentWaveHeight,
         currentPeriod: currentWavePeriod,
+        calibrationArmed: calibrationRequested,
+        offsets: (activeOptions && activeOptions.offsets) || { pitch: 0, roll: 0 },
+        lastCalibratedAt
       });
+    });
+
+    // Arms an immediate IMU zero calibration: the very next incoming
+    // RaceBox packet captures the current accelerometer-derived pitch/roll
+    // as the new zero offset and persists it via savePluginOptions. Unlike
+    // the config-screen "zeroImuNow" checkbox (which only takes effect on
+    // Save, and Save triggers plugin.stop()+start() — a full BLE
+    // disconnect/reconnect), this flips a flag the running session already
+    // polls on every packet, so calibrating never interrupts the live data
+    // stream. Requires the boat to be level and floating naturally the
+    // moment this fires, same as the checkbox method.
+    router.post('/calibrate', (req, res) => {
+      if (!currentDevice) {
+        res.status(409).json({ error: 'RaceBox not connected yet — wait for a live connection before calibrating.' });
+        return;
+      }
+      calibrationRequested = true;
+      if (app) app.setProviderStatus('CAL: Armed for calibration. Boat must be level.');
+      res.json({ ok: true, armed: true });
     });
   };
 
