@@ -385,6 +385,19 @@ module.exports = function (app) {
     const finalPitch = calculatedPitch - currentOffsets.pitch;
 
     const values = [
+      // Signal K's spec defines navigation.attitude as a single object-valued
+      // path ({roll, pitch, yaw}), the same way navigation.position is one
+      // object ({latitude, longitude}) rather than two separate paths (see
+      // the position value further down in this same delta). The dotted
+      // navigation.attitude.roll / .pitch paths below are kept for anyone
+      // already relying on them, but plugins that subscribe to the exact
+      // path "navigation.attitude" (e.g. speedandcurrent's heel input for
+      // leeway/current calculation) only ever see an update when a delta
+      // uses that exact path — they never receive one from dotted sub-path
+      // deltas alone, so without this composite entry their heel/roll input
+      // silently never arrives. yaw is omitted rather than faked as 0,
+      // since this IMU has no compass/magnetometer to back a heading claim.
+      { path: 'navigation.attitude', value: { roll: finalRoll, pitch: finalPitch } },
       { path: 'navigation.attitude.roll', value: finalRoll },
       { path: 'navigation.attitude.pitch', value: finalPitch },
       { path: 'navigation.rateOfTurn', value: gyroZ },

@@ -12,6 +12,10 @@ Bluetooth connectivity is handled by [`node-ble`](https://github.com/chrvadala/n
 
 ---
 
+## What's new in 1.4.1
+
+- **Fix: `navigation.attitude` is now also published as a proper composite object (`{roll, pitch}`), not just the split `navigation.attitude.roll` / `navigation.attitude.pitch` paths.** Signal K's spec defines `navigation.attitude` the same way it defines `navigation.position` — as one path carrying an object value — but this plugin was only ever sending the two dotted sub-paths. Any consumer that subscribes to the exact path `navigation.attitude` (rather than reading the merged REST tree) never received an update from those dotted deltas alone, so its heel/roll input silently never arrived. This was caught via the [`speedandcurrent`](https://github.com/Asw1n/speedandcurrent) plugin, which needs roll (heel) for its leeway/current calculation and was falling back to uncorrected boat speed with no heel input as a result. The dotted paths are kept alongside the new composite one for backward compatibility with anything already relying on them.
+
 ## Features
 * **Zero Configuration Pairing:** Auto-discovers and connects to the first device advertising as "RaceBox" — no MAC addresses to find or type.
 * **Full Telemetry Mapping:** Position, SOG, COG, Pitch, Roll, satellite count, battery status, and GPS accuracy.
