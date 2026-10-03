@@ -40,13 +40,25 @@ const pluginMetadata = {
       waveFilterPeriod: {
         type: 'number',
         title: 'Wave Filter: Dominant Period (seconds)',
-        description: 'Starting estimate of the dominant wave period used by the Ornstein-Uhlenbeck Kalman filter. Use 3–6 s for Baltic or coastal chop; 7–12 s for open-ocean swell. The filter is tolerant of a rough estimate here — it does not need to be exact.',
+        description: 'Starting estimate of the dominant wave period used by the Ornstein-Uhlenbeck Kalman filter. Use 3–6 s for Baltic or coastal chop; 7–12 s for open-ocean swell. This is only a starting value: the filter now measures the dominant period from the heave zero-crossings and follows it. That matters because the inferred wave height scales with the SQUARE of the ratio between this setting and the real period — at 8 s against 2 s chop it over-reads by sixteen times.',
         default: 8.0
       },
       waveFilterDamping: {
         type: 'number',
         title: 'Wave Filter: Damping Ratio (ζ, 0.05–0.50)',
         description: 'Controls how quickly oscillations decay in the wave model. Lower values (0.05–0.10) suit long ocean swell that rings for many cycles. Higher values (0.25–0.40) suit short, steep chop that damps quickly. Leave at 0.15 for most conditions.',
+        default: 0.15
+      },
+      waveAttitudeTau: {
+        type: 'number',
+        title: 'Wave Filter: Attitude Time Constant (seconds)',
+        description: 'How slowly the wave pipeline leans on the accelerometer as a gravity reference. The attitude it uses is integrated from the gyro, because an accelerometer-only tilt estimate is degenerate for this purpose — it makes the "vertical" channel equal to the vector magnitude, and the resulting wave height tracks heel instead of sea state. Longer values (20–60 s) reject sailing accelerations better; shorter values recover faster from gyro drift. 20 s suits a keelboat.',
+        default: 20
+      },
+      waveAttitudeGate: {
+        type: 'number',
+        title: 'Wave Filter: Gravity Trust Gate (g)',
+        description: 'The accelerometer is only used to correct attitude while total specific force is within this much of 1 g — that is, while it is plausibly measuring gravity rather than the boat accelerating. 0.15 g is a reasonable default; lower is stricter.',
         default: 0.15
       },
       waveHsWindow: {
@@ -127,6 +139,17 @@ module.exports = function (app) {
   let heaveUpdateCounter = 0;           // throttles Hs recomputation to once per second
   let zeroXingTimes = [];               // timestamps of upward heave zero-crossings
   let prevHeavePosSign = false;
+  // Attitude used ONLY by the wave pipeline. The published navigation.attitude.*
+  // stays accel-derived so nothing downstream changes, but the wave pipeline
+  // cannot use that estimate: see the note above the tilt compensation below.
+  let waveRoll = null, wavePitch = null;
+  let waveAttitudeSamples = 0;
+  // The wave pipeline advances on sample count, not wall clock. The two had
+  // been mixed: the filter stepped at a fixed DT while the period estimate and
+  // the auto-zero read Date.now(), so a bursty BLE delivery (every reconnect,
+  // and every time the host stalls) silently corrupted both.
+  let waveClockMs = 0;
+  let adaptivePeriod = 0;               // smoothed dominant period driving omega0
   let lastGyro = { x: 0, y: 0, z: 0 };
   let peakSlam = 0;
   let slamTimer = 0;
@@ -134,7 +157,8 @@ module.exports = function (app) {
   // Persistent wave output
   let currentWaveHeight = 0;
   let currentWavePeriod = 0;
-  let lastWaveDetectedTime = Date.now();
+  let lastWaveDetectedTime = 0;   // on waveClockMs, not wall clock
+  let waveHeightSuppressed = 0;         // count of physically impossible Hs rejected
 
   plugin.start = function (options) {
     if (!app) return;
@@ -410,10 +434,55 @@ module.exports = function (app) {
     ];
 
     if (activeOptions.enableWaveDetection) {
-      const sinP = Math.sin(finalPitch);
-      const cosP = Math.cos(finalPitch);
-      const sinR = Math.sin(finalRoll);
-      const cosR = Math.cos(finalRoll);
+      // --- Attitude for the wave pipeline ---
+      //
+      // Rotating an acceleration vector into the earth frame using angles derived
+      // from that same vector is degenerate: substituting
+      // roll = atan2(aY, aZ), pitch = atan2(-aX, hypot(aY, aZ)) into
+      //   -aX*sinP + aY*sinR*cosP + aZ*cosR*cosP
+      // reduces exactly to |a|. Verified against a logged sail: the published
+      // "vertical" channel matched the raw vector magnitude to 5e-4 g (r=0.99998).
+      // So dynamicZ carried no vertical direction at all — only how far total
+      // specific force sat from 1 g — and the resulting Hs tracked heel angle
+      // (r = +0.973 against heave sigma) instead of sea state.
+      //
+      // The fix is an attitude estimate that does not come from this sample:
+      // integrate the gyro, and lean on the accelerometer for the long-term
+      // reference only while total specific force is near 1 g, i.e. while it is
+      // plausibly measuring gravity rather than the boat's own acceleration.
+      const accMag = Math.sqrt(accelX * accelX + accelY * accelY + accelZ * accelZ);
+
+      if (waveRoll === null) {
+        waveRoll = calculatedRoll;
+        wavePitch = calculatedPitch;
+      } else {
+        // Euler kinematics; pitch is clamped so tan() cannot run away near vertical
+        const cp = Math.cos(waveRoll), sp = Math.sin(waveRoll);
+        const tanP0 = Math.tan(Math.max(-1.3, Math.min(1.3, wavePitch)));
+        waveRoll  += (gyroX + sp * tanP0 * gyroY + cp * tanP0 * gyroZ) * DT;
+        wavePitch += (cp * gyroY - sp * gyroZ) * DT;
+
+        // Gravity reference, applied slowly and only when it is trustworthy
+        const tauS = Math.max(2, activeOptions.waveAttitudeTau || 20);
+        const gate = Math.max(0.02, Math.min(0.5, activeOptions.waveAttitudeGate || 0.15));
+        if (Math.abs(accMag - 1.0) < gate) {
+          const k = DT / tauS;
+          let dR = calculatedRoll - waveRoll;
+          while (dR >  Math.PI) dR -= 2 * Math.PI;
+          while (dR < -Math.PI) dR += 2 * Math.PI;
+          let dP = calculatedPitch - wavePitch;
+          while (dP >  Math.PI) dP -= 2 * Math.PI;
+          while (dP < -Math.PI) dP += 2 * Math.PI;
+          waveRoll  += k * dR;
+          wavePitch += k * dP;
+        }
+      }
+      waveAttitudeSamples++;
+
+      const sinP = Math.sin(wavePitch - (currentOffsets.pitch || 0));
+      const cosP = Math.cos(wavePitch - (currentOffsets.pitch || 0));
+      const sinR = Math.sin(waveRoll - (currentOffsets.roll || 0));
+      const cosR = Math.cos(waveRoll - (currentOffsets.roll || 0));
 
       const trueZ    = -accelX * sinP + accelY * sinR * cosP + accelZ * cosR * cosP;
       const trueZMS2 = trueZ * 9.80665;
@@ -423,7 +492,20 @@ module.exports = function (app) {
       // State x = [s (heave m), v (heave vel m/s), b (accel bias m/s²)]
       // Model: s'' = -ω₀²·s − 2ζω₀·v  (damped harmonic oscillator / OU process)
       // Observation: z = s'' + b + noise  →  H = [-ω₀², -2ζω₀, 1]
-      const omega0 = 2 * Math.PI / Math.max(activeOptions.waveFilterPeriod || 8.0, 2.0);
+      waveClockMs += DT * 1000;
+
+      // omega0 follows the sea, not a setting.
+      //
+      // The OU observation model says accel = omega0^2 * s, so the heave it
+      // infers scales with (configured period / actual period)^2. At the stock
+      // 8 s against the 2.1 s chop actually measured on 2026-10-03 that is a
+      // factor of fourteen — which is most of why a flat lake reported metres.
+      // The zero-crossing estimate below tracks the forcing frequency even when
+      // omega0 is wrong (the filter is driven, not free-running), so feeding it
+      // back is stable; it is smoothed and clamped regardless.
+      const configuredPeriod = Math.max(activeOptions.waveFilterPeriod || 8.0, 2.0);
+      const effectivePeriod = adaptivePeriod > 0 ? adaptivePeriod : configuredPeriod;
+      const omega0 = 2 * Math.PI / Math.max(effectivePeriod, 1.5);
       const zeta   = Math.min(Math.max(activeOptions.waveFilterDamping  || 0.15, 0.01), 0.50);
       const omSq   = omega0 * omega0;
       const damp2  = 2 * zeta * omega0;
@@ -460,34 +542,72 @@ module.exports = function (app) {
       heaveWindow.push(kfS);
       if (heaveWindow.length > windowSamples) heaveWindow.shift();
       heaveUpdateCounter = (heaveUpdateCounter + 1) % 25;
-      if (heaveWindow.length >= 750 && heaveUpdateCounter === 0) {
+      // The complementary filter needs a few time constants before its output
+      // means anything; publishing during that settling produced the drift ramp.
+      const attitudeSettled = waveAttitudeSamples > 25 * 3 * Math.max(2, activeOptions.waveAttitudeTau || 20);
+      if (heaveWindow.length >= 750 && heaveUpdateCounter === 0 && attitudeSettled) {
         const mean = heaveWindow.reduce((a, b) => a + b, 0) / heaveWindow.length;
         const variance = heaveWindow.reduce((a, v) => a + (v - mean) * (v - mean), 0) / heaveWindow.length;
         const hs = 4 * Math.sqrt(variance);
-        if (hs > 0.05) { currentWaveHeight = hs; lastWaveDetectedTime = Date.now(); }
+        // Physical sanity: deep-water wavelength L = 1.56*T², and a wave breaks
+        // near H/L = 1/7. An Hs steeper than that cannot be sea state, it is
+        // filter drift. On the reference sail this rejected every bad sample
+        // (median H/L 0.70, five times past breaking) and no good one.
+        let plausible = true;
+        if (currentWavePeriod > 1.5) {
+          const limit = 0.14 * 1.56 * currentWavePeriod * currentWavePeriod;
+          if (hs > limit) {
+            plausible = false;
+            waveHeightSuppressed++;
+            if (debug && app && waveHeightSuppressed % 25 === 1) {
+              app.debug(`wave: rejected Hs ${hs.toFixed(2)} m at T=${currentWavePeriod.toFixed(1)} s ` +
+                        `(steeper than the ${limit.toFixed(2)} m breaking limit) — filter has not settled`);
+            }
+          }
+        }
+        if (plausible && hs > 0.05) { currentWaveHeight = hs; lastWaveDetectedTime = waveClockMs; }
       }
 
       // Wave period from upward zero-crossings of filtered heave
       const isPos = kfS > 0;
       if (!prevHeavePosSign && isPos) {
-        zeroXingTimes.push(Date.now());
+        zeroXingTimes.push(waveClockMs);
         if (zeroXingTimes.length > 6) zeroXingTimes.shift();
         if (zeroXingTimes.length >= 3) {
           let total = 0;
           for (let i = 1; i < zeroXingTimes.length; i++) total += zeroXingTimes[i] - zeroXingTimes[i-1];
           const T = (total / (zeroXingTimes.length - 1)) / 1000;
-          if (T > 1.5 && T < 25) currentWavePeriod = T;
+          if (T > 1.5 && T < 25) {
+            currentWavePeriod = T;
+            // Slow EMA, and never let one estimate move omega0 by more than
+            // 20% of the way, so a bad crossing cannot destabilise the filter.
+            adaptivePeriod = adaptivePeriod > 0 ? adaptivePeriod + 0.2 * (T - adaptivePeriod) : T;
+            adaptivePeriod = Math.max(1.5, Math.min(25, adaptivePeriod));
+          }
         }
       }
       prevHeavePosSign = isPos;
 
-      // Auto-zero and flush buffers if no wave activity for 60s
-      const now = Date.now();
+      // Auto-zero and flush buffers if no wave activity for 60s.
+      //
+      // lastWaveDetectedTime MUST be rearmed here. Without it the condition stays
+      // true forever once it first trips, so heaveWindow is cleared on every
+      // sample at 25 Hz and can never reach the 750 it needs to compute Hs at
+      // all — a permanent latch. On the reference sail the channel read a hard
+      // 0.00 for the first 51 minutes (37% of the day's samples) for this reason,
+      // while heave had already drifted past a metre.
+      const now = waveClockMs;
       if (now - lastWaveDetectedTime > 60000) {
         currentWaveHeight = 0;
         currentWavePeriod = 0;
         heaveWindow.length = 0;
         zeroXingTimes.length = 0;
+        // adaptivePeriod deliberately survives the flush. It is measured from
+        // heave zero-crossings, which stay meaningful even while Hs is being
+        // rejected as implausible — and clearing it here would reset omega0 to
+        // the configured value, re-inflate Hs, get it rejected again, and leave
+        // the estimate stuck in that loop forever.
+        lastWaveDetectedTime = now;
       }
 
       // Complex Slam Detection (Multi-vector impact analysis)
@@ -600,6 +720,12 @@ module.exports = function (app) {
       res.json({ ok: true, armed: true });
     });
   };
+
+  // Test hook: lets the suite drive the real parser and wave pipeline with
+  // synthetic packets instead of a live BLE device. Not part of the plugin API.
+  Object.defineProperty(plugin, '_ingestForTest', {
+    value: processIncomingBytes, enumerable: false
+  });
 
   return plugin;
 };
